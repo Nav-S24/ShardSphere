@@ -1,0 +1,22 @@
+[
+  "backend/tests/test_coordinator_models.py::test_database_schema_creation_and_file_model",
+  "backend/tests/test_distributor.py::test_chunk_splitting",
+  "backend/tests/test_distributor.py::test_empty_file_chunk_splitting",
+  "backend/tests/test_leader_election.py::test_leader_lease_acquisition_and_fencing_token",
+  "backend/tests/test_leader_election_two_instances.py::test_lease_expiry_takeover_and_token_increment",
+  "backend/tests/test_leader_election_two_instances.py::test_stale_leader_split_brain_write_rejection",
+  "backend/tests/test_leader_election_two_instances.py::test_two_coordinator_instances_lease_acquisition_and_fencing",
+  "backend/tests/test_real_fault_injection.py::test_real_storage_node_failure_healing_and_recovery",
+  "backend/tests/test_returning_node_reconciliation.py::test_returning_node_reconciliation_active_and_stale_chunks",
+  "backend/tests/test_storage_engine_integration.py::test_end_to_end_storage_engine_lifecycle",
+  "backend/tests/test_storage_engine_integration.py::test_replica_corruption_failover",
+  "backend/tests/test_storage_engine_unit.py::test_1mib_chunk_splitting_and_checksums",
+  "backend/tests/test_storage_engine_unit.py::test_arbitrary_binary_file_integrity",
+  "backend/tests/test_storage_engine_unit.py::test_empty_file_handling",
+  "backend/tests/test_storage_engine_unit.py::test_placement_fails_when_insufficient_healthy_nodes",
+  "backend/tests/test_storage_engine_unit.py::test_placement_strategy_distinctness_and_distribution",
+  "storage_node/tests/test_storage_node.py::test_chunk_checksum_mismatch",
+  "storage_node/tests/test_storage_node.py::test_chunk_write_and_read",
+  "storage_node/tests/test_storage_node.py::test_path_traversal_prevention",
+  "storage_node/tests/test_storage_node.py::test_storage_stats_and_delete"
+]

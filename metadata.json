@@ -1,0 +1,6 @@
+{
+  "name": "ShardSphere",
+  "description": "Self-Healing Distributed File Storage system with independent storage nodes, automatic re-replication, and real-time cluster health monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

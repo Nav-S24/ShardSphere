@@ -1,0 +1,254 @@
+version: '3.9'
+
+networks:
+  shardsphere-net:
+    driver: bridge
+    name: shardsphere-network
+
+volumes:
+  postgres_data:
+    name: shardsphere_postgres_data
+  storage_node_1_data:
+    name: shardsphere_node_1_volume
+  storage_node_2_data:
+    name: shardsphere_node_2_volume
+  storage_node_3_data:
+    name: shardsphere_node_3_volume
+  storage_node_4_data:
+    name: shardsphere_node_4_volume
+  storage_node_5_data:
+    name: shardsphere_node_5_volume
+
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL Metadata Database
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: shardsphere-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shardsphere}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shardsphere_secure_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-shardsphere}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shardsphere} -d ${POSTGRES_DB:-shardsphere}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Storage Node 1 (Independent Service & Volume)
+  # ----------------------------------------------------------------------------
+  storage-node-1:
+    build:
+      context: ./storage_node
+      dockerfile: Dockerfile
+    container_name: shardsphere-storage-node-1
+    restart: unless-stopped
+    environment:
+      NODE_ID: storage-node-1
+      NODE_NAME: "Storage Node 1"
+      HOST: 0.0.0.0
+      PORT: 8001
+      ADVERTISED_URL: http://storage-node-1:8001
+      STORAGE_DIR: /data/chunks
+      STORAGE_LIMIT_BYTES: 10737418240 # 10 GiB
+    ports:
+      - "8001:8001"
+    volumes:
+      - storage_node_1_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Storage Node 2 (Independent Service & Volume)
+  # ----------------------------------------------------------------------------
+  storage-node-2:
+    build:
+      context: ./storage_node
+      dockerfile: Dockerfile
+    container_name: shardsphere-storage-node-2
+    restart: unless-stopped
+    environment:
+      NODE_ID: storage-node-2
+      NODE_NAME: "Storage Node 2"
+      HOST: 0.0.0.0
+      PORT: 8002
+      ADVERTISED_URL: http://storage-node-2:8002
+      STORAGE_DIR: /data/chunks
+      STORAGE_LIMIT_BYTES: 10737418240
+    ports:
+      - "8002:8002"
+    volumes:
+      - storage_node_2_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Storage Node 3 (Independent Service & Volume)
+  # ----------------------------------------------------------------------------
+  storage-node-3:
+    build:
+      context: ./storage_node
+      dockerfile: Dockerfile
+    container_name: shardsphere-storage-node-3
+    restart: unless-stopped
+    environment:
+      NODE_ID: storage-node-3
+      NODE_NAME: "Storage Node 3"
+      HOST: 0.0.0.0
+      PORT: 8003
+      ADVERTISED_URL: http://storage-node-3:8003
+      STORAGE_DIR: /data/chunks
+      STORAGE_LIMIT_BYTES: 10737418240
+    ports:
+      - "8003:8003"
+    volumes:
+      - storage_node_3_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Storage Node 4 (Independent Service & Volume)
+  # ----------------------------------------------------------------------------
+  storage-node-4:
+    build:
+      context: ./storage_node
+      dockerfile: Dockerfile
+    container_name: shardsphere-storage-node-4
+    restart: unless-stopped
+    environment:
+      NODE_ID: storage-node-4
+      NODE_NAME: "Storage Node 4"
+      HOST: 0.0.0.0
+      PORT: 8004
+      ADVERTISED_URL: http://storage-node-4:8004
+      STORAGE_DIR: /data/chunks
+      STORAGE_LIMIT_BYTES: 10737418240
+    ports:
+      - "8004:8004"
+    volumes:
+      - storage_node_4_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Storage Node 5 (Independent Service & Volume)
+  # ----------------------------------------------------------------------------
+  storage-node-5:
+    build:
+      context: ./storage_node
+      dockerfile: Dockerfile
+    container_name: shardsphere-storage-node-5
+    restart: unless-stopped
+    environment:
+      NODE_ID: storage-node-5
+      NODE_NAME: "Storage Node 5"
+      HOST: 0.0.0.0
+      PORT: 8005
+      ADVERTISED_URL: http://storage-node-5:8005
+      STORAGE_DIR: /data/chunks
+      STORAGE_LIMIT_BYTES: 10737418240
+    ports:
+      - "8005:8005"
+    volumes:
+      - storage_node_5_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8005/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Coordinator Service (FastAPI Distributed Engine)
+  # ----------------------------------------------------------------------------
+  coordinator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shardsphere-coordinator
+    restart: unless-stopped
+    environment:
+      COORDINATOR_ID: ${COORDINATOR_ID:-coordinator-primary-1}
+      PORT: 8000
+      HOST: 0.0.0.0
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://shardsphere:shardsphere_secure_dev_pass@postgres:5432/shardsphere}
+      DATABASE_URL_SYNC: ${DATABASE_URL_SYNC:-postgresql://shardsphere:shardsphere_secure_dev_pass@postgres:5432/shardsphere}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-3}
+      DEFAULT_CHUNK_SIZE_BYTES: ${DEFAULT_CHUNK_SIZE_BYTES:-1048576}
+      STORAGE_NODES: "storage-node-1:http://storage-node-1:8001,storage-node-2:http://storage-node-2:8002,storage-node-3:http://storage-node-3:8003,storage-node-4:http://storage-node-4:8004,storage-node-5:http://storage-node-5:8005"
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-2}
+      MISSED_HEARTBEATS_SUSPECT: ${MISSED_HEARTBEATS_SUSPECT:-3}
+      FAILURE_THRESHOLD_SECONDS: ${FAILURE_THRESHOLD_SECONDS:-10}
+      LEASE_DURATION_SECONDS: ${LEASE_DURATION_SECONDS:-10}
+      LEASE_RENEW_INTERVAL_SECONDS: ${LEASE_RENEW_INTERVAL_SECONDS:-3}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-node-1:
+        condition: service_healthy
+      storage-node-2:
+        condition: service_healthy
+      storage-node-3:
+        condition: service_healthy
+      storage-node-4:
+        condition: service_healthy
+      storage-node-5:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    networks:
+      - shardsphere-net
+
+  # ----------------------------------------------------------------------------
+  # Frontend UI Dashboard
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: shardsphere-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_COORDINATOR_API_URL: http://localhost:8000
+    depends_on:
+      - coordinator
+    networks:
+      - shardsphere-net
