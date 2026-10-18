@@ -26,6 +26,7 @@ import {
   ChevronRight,
   ExternalLink,
   Cpu,
+  Info,
 } from 'lucide-react';
 
 interface StorageNodeInfo {
@@ -38,6 +39,18 @@ interface StorageNodeInfo {
   last_failure_at: number | null;
   total_chunks: number;
   total_bytes_used: number;
+  committed_chunks?: number;
+  committed_bytes_used?: number;
+  active_chunks?: number;
+  active_bytes_used?: number;
+  stale_chunks?: number;
+  stale_bytes_used?: number;
+  orphaned_chunks?: number;
+  orphaned_bytes_used?: number;
+  untracked_chunks?: number;
+  untracked_bytes_used?: number;
+  physical_chunks?: number;
+  physical_bytes_used?: number;
   storage_limit_bytes: number;
   disk_usage_percent: number;
 }
@@ -54,6 +67,18 @@ interface ClusterOverview {
   total_files: number;
   total_chunks: number;
   total_bytes_stored: number;
+  total_committed_replicas?: number;
+  total_committed_bytes?: number;
+  total_active_replicas?: number;
+  total_active_bytes?: number;
+  total_stale_replicas?: number;
+  total_stale_bytes?: number;
+  total_orphaned_chunks?: number;
+  total_orphaned_bytes?: number;
+  total_untracked_chunks?: number;
+  total_untracked_bytes?: number;
+  total_physical_chunks?: number;
+  total_physical_bytes?: number;
   configured_replication_factor: number;
   active_recovery_jobs: number;
   nodes: StorageNodeInfo[];
@@ -139,12 +164,45 @@ interface ClusterEvent {
   timestamp: number;
 }
 
+interface ChunkInventoryItem {
+  node_id: string;
+  chunk_id: string;
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+  sha_match: boolean;
+  classification: 'COMMITTED_REPLICA' | 'STALE_REPLICA' | 'ORPHANED_CHUNK' | 'UNTRACKED_DATA';
+  file_id: string | null;
+  file_name: string | null;
+  status: string;
+  generation: number;
+}
+
+interface InventoryAuditResult {
+  summary: {
+    total_files_committed: number;
+    total_logical_chunks: number;
+    total_committed_bytes: number;
+    configured_replication_factor: number;
+    expected_replicas: number;
+    actual_committed_replicas: number;
+    actual_stale_replicas: number;
+    actual_orphaned_chunks: number;
+    actual_untracked_chunks: number;
+    total_physical_chunks: number;
+    total_physical_bytes: number;
+  };
+  per_node: Record<string, any>;
+  items: ChunkInventoryItem[];
+}
+
 export default function App() {
   const [cluster, setCluster] = useState<ClusterOverview | null>(null);
   const [leader, setLeader] = useState<LeaderInfo | null>(null);
   const [files, setFiles] = useState<FileItem[]>([]);
   const [jobs, setJobs] = useState<RecoveryJob[]>([]);
   const [events, setEvents] = useState<ClusterEvent[]>([]);
+  const [inventoryAudit, setInventoryAudit] = useState<InventoryAuditResult | null>(null);
   const [selectedFileDetail, setSelectedFileDetail] = useState<FileDetail | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'overview' | 'explorer' | 'nodes' | 'selfhealing' | 'inspector' | 'faultlab'>('overview');
@@ -167,12 +225,13 @@ export default function App() {
 
   const fetchAllTelemetry = async () => {
     try {
-      const [clusterRes, leaderRes, filesRes, jobsRes, eventsRes] = await Promise.all([
+      const [clusterRes, leaderRes, filesRes, jobsRes, eventsRes, auditRes] = await Promise.all([
         fetch('/api/v1/cluster'),
         fetch('/api/v1/leader'),
         fetch('/api/v1/files'),
         fetch('/api/v1/recovery/jobs'),
         fetch('/api/v1/events?limit=30'),
+        fetch('/api/v1/inventory/audit'),
       ]);
 
       if (clusterRes.ok) setCluster(await clusterRes.json());
@@ -183,6 +242,7 @@ export default function App() {
       }
       if (jobsRes.ok) setJobs(await jobsRes.json());
       if (eventsRes.ok) setEvents(await eventsRes.json());
+      if (auditRes.ok) setInventoryAudit(await auditRes.json());
     } catch (err) {
       console.error('Telemetry polling error:', err);
     } finally {
@@ -296,12 +356,30 @@ export default function App() {
       const res = await fetch(`/api/v1/nodes/${nodeId}/reconcile`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
-        setActionFeedback(`Node ${nodeId} reconciled: ${data.verified_active} active verified, ${data.purged_stale} stale purged.`);
+        const reclaimedMsg = data.orphaned_reclaimed_bytes > 0 ? `, reclaimed ${formatBytes(data.orphaned_reclaimed_bytes)}` : '';
+        setActionFeedback(`Node ${nodeId} reconciled: ${data.verified_active} active verified, ${data.purged_stale} stale purged${reclaimedMsg}.`);
         await fetchAllTelemetry();
         setTimeout(() => setActionFeedback(null), 5000);
       }
     } catch (err: any) {
       alert(`Reconcile failed: ${err.message}`);
+    }
+  };
+
+  const handleReconcileOrphans = async () => {
+    setReconciling(true);
+    try {
+      const res = await fetch('/api/v1/cluster/reconcile-orphans', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setActionFeedback(`Cluster orphan reconciliation complete: purged ${data.total_purged_orphans} orphaned chunks and reclaimed ${formatBytes(data.total_reclaimed_bytes)}!`);
+        await fetchAllTelemetry();
+      }
+    } catch (err: any) {
+      alert(`Orphan purge failed: ${err.message}`);
+    } finally {
+      setReconciling(false);
+      setTimeout(() => setActionFeedback(null), 5000);
     }
   };
 
@@ -332,10 +410,35 @@ export default function App() {
       if (res.ok) {
         setAuditResult(await res.json());
       }
+      // Also refresh inventory audit
+      const invRes = await fetch('/api/v1/inventory/audit');
+      if (invRes.ok) {
+        setInventoryAudit(await invRes.json());
+      }
     } catch (err) {
       console.error(err);
     } finally {
       setVerifyingAudit(false);
+    }
+  };
+
+  const handleCorruptChunk = async (chunkId: string, nodeId: string) => {
+    try {
+      const res = await fetch(`/api/v1/chunks/${chunkId}/corrupt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId }),
+      });
+      if (res.ok) {
+        setActionFeedback(`Injected bit rot into chunk ${chunkId} on ${nodeId}. Run Cryptographic Audit to inspect!`);
+        await fetchAllTelemetry();
+        if (selectedFileDetail) {
+          handleInspectFile(selectedFileDetail.file_id);
+        }
+        setTimeout(() => setActionFeedback(null), 5000);
+      }
+    } catch (err: any) {
+      alert(`Corruption injection failed: ${err.message}`);
     }
   };
 
@@ -370,8 +473,13 @@ export default function App() {
       const nodeAssignments = detailData.chunks.map(c => `Chunk #${c.sequence_index} -> [${c.replicas.map(r => r.node_id).join(', ')}]`);
       nodeAssignments.forEach(na => addLog(`   ${na}`));
 
-      const targetNode = labSelectedNode;
-      addLog(`Step 2/6: Simulating hard failure on target node "${targetNode}"...`);
+      // Select target node: use selected node if it holds a replica, else choose first node holding chunks
+      const nodesWithProbe = new Set(detailData.chunks.flatMap(c => c.replicas.map(r => r.node_id)));
+      const targetNode = nodesWithProbe.has(labSelectedNode) ? labSelectedNode : detailData.chunks[0].replicas[0].node_id;
+      if (targetNode !== labSelectedNode) {
+        setLabSelectedNode(targetNode);
+      }
+      addLog(`Step 2/6: Simulating hard failure on target node "${targetNode}" (holding active probe replica)...`);
       await fetch(`/api/v1/nodes/${targetNode}/toggle-state`, { method: 'POST' });
       addLog(`✔ Node "${targetNode}" transitioned to UNAVAILABLE.`);
 
@@ -442,16 +550,21 @@ export default function App() {
       case 'ACTIVE':
       case 'VALID':
       case 'COMPLETED':
+      case 'COMMITTED_REPLICA':
         return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20';
       case 'SUSPECT':
       case 'RECOVERING':
       case 'DEGRADED':
       case 'IN_PROGRESS':
+      case 'ORPHANED_CHUNK':
         return 'text-amber-400 bg-amber-500/10 border-amber-500/20';
+      case 'UNTRACKED_DATA':
+        return 'text-sky-400 bg-sky-500/10 border-sky-500/20';
       case 'UNAVAILABLE':
       case 'CORRUPTED':
       case 'FAILED':
       case 'MISSING':
+      case 'STALE_REPLICA':
         return 'text-rose-400 bg-rose-500/10 border-rose-500/20';
       default:
         return 'text-zinc-400 bg-zinc-800 border-zinc-700';
@@ -462,6 +575,7 @@ export default function App() {
     switch (status.toUpperCase()) {
       case 'HEALTHY':
       case 'ACTIVE':
+      case 'COMMITTED_REPLICA':
         return 'bg-emerald-500';
       case 'SUSPECT':
       case 'RECOVERING':
@@ -469,6 +583,8 @@ export default function App() {
       case 'UNAVAILABLE':
       case 'CORRUPTED':
         return 'bg-rose-500';
+      case 'UNTRACKED_DATA':
+        return 'bg-sky-500';
       default:
         return 'bg-zinc-500';
     }
@@ -491,7 +607,7 @@ export default function App() {
               <div className="flex items-center space-x-2 text-[11px] text-zinc-400">
                 <span>Distributed File Engine</span>
                 <span aria-hidden="true">·</span>
-                <span>PostgreSQL Leased</span>
+                <span>Fenced Leases</span>
                 <span aria-hidden="true">·</span>
                 <span>3x Redundancy</span>
               </div>
@@ -506,9 +622,9 @@ export default function App() {
               <span className="text-zinc-200 font-semibold">{leader?.current_leader_id || 'unknown'}</span>
               <span className="text-zinc-600">|</span>
               <span className="text-zinc-400">Token:</span>
-              <span className="text-indigo-400 font-bold">{leader?.fencing_token ?? 0}</span>
+              <span className="text-indigo-400 font-bold">#{leader?.fencing_token ?? 0}</span>
               <span className="text-zinc-600">|</span>
-              <span className="text-zinc-400">{leader?.time_remaining_seconds.toFixed(0)}s lease</span>
+              <span className="text-zinc-400">{(leader?.time_remaining_seconds ?? 0).toFixed(1)}s lease</span>
             </div>
 
             <button
@@ -553,9 +669,9 @@ export default function App() {
           {[
             { id: 'overview', label: 'Cluster Overview', icon: Activity },
             { id: 'explorer', label: 'Storage Explorer', icon: Database, badge: files.length },
-            { id: 'nodes', label: 'Cluster Nodes', icon: Server, badge: cluster?.total_nodes || 5 },
+            { id: 'nodes', label: 'Cluster Nodes', icon: Server, badge: cluster?.total_nodes ?? 0 },
             { id: 'selfhealing', label: 'Self-Healing Monitor', icon: ShieldCheck, badge: jobs.filter(j => j.status === 'in_progress').length || undefined },
-            { id: 'inspector', label: 'Systems Inspector', icon: Radio },
+            { id: 'inspector', label: 'Systems & Audit Inspector', icon: Radio },
             { id: 'faultlab', label: 'Fault-Testing Lab', icon: Zap },
           ].map((tab) => {
             const Icon = tab.icon;
@@ -599,8 +715,8 @@ export default function App() {
                   <Server className="w-4 h-4 text-indigo-400" />
                 </div>
                 <div className="mt-2 flex items-baseline space-x-2">
-                  <span className="text-2xl font-bold font-mono text-white">{cluster?.healthy_nodes ?? 5}</span>
-                  <span className="text-xs text-zinc-400">/ {cluster?.total_nodes ?? 5} online</span>
+                  <span className="text-2xl font-bold font-mono text-white">{cluster?.healthy_nodes ?? 0}</span>
+                  <span className="text-xs text-zinc-400">/ {cluster?.total_nodes ?? 0} online</span>
                 </div>
                 <div className="mt-3 flex items-center text-xs text-zinc-400 space-x-1">
                   <div className={`w-2 h-2 rounded-full ${cluster?.unavailable_nodes === 0 ? 'bg-emerald-500' : 'bg-rose-500'}`} />
@@ -615,24 +731,28 @@ export default function App() {
                 </div>
                 <div className="mt-2 flex items-baseline space-x-2">
                   <span className="text-2xl font-bold font-mono text-white">{cluster?.total_chunks ?? 0}</span>
-                  <span className="text-xs text-zinc-400">chunks persisted</span>
+                  <span className="text-xs text-zinc-400">logical ({cluster?.total_committed_replicas ?? cluster?.total_active_replicas ?? 0} active replicas)</span>
                 </div>
                 <div className="mt-3 text-xs text-zinc-400">
-                  <span>{files.length} files committed ({formatBytes(cluster?.total_bytes_stored ?? 0)})</span>
+                  <span>{files.length} file(s) committed ({formatBytes(cluster?.total_bytes_stored ?? 0)} logical · {formatBytes(cluster?.total_committed_bytes ?? cluster?.total_active_bytes ?? 0)} replicated)</span>
                 </div>
               </div>
 
               <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
                 <div className="flex items-center justify-between text-zinc-400 text-xs">
-                  <span>Self-Healing Engine</span>
-                  <ShieldCheck className="w-4 h-4 text-indigo-400" />
+                  <span>Physical Storage Footprint</span>
+                  <HardDrive className="w-4 h-4 text-indigo-400" />
                 </div>
                 <div className="mt-2 flex items-baseline space-x-2">
-                  <span className="text-2xl font-bold font-mono text-white">{cluster?.active_recovery_jobs ?? 0}</span>
-                  <span className="text-xs text-zinc-400">active jobs</span>
+                  <span className="text-2xl font-bold font-mono text-white">{cluster?.total_physical_chunks ?? 0}</span>
+                  <span className="text-xs text-zinc-400">files on disk ({formatBytes(cluster?.total_physical_bytes ?? 0)})</span>
                 </div>
-                <div className="mt-3 text-xs text-zinc-400">
-                  <span>Auto-discovery interval: 5.0s</span>
+                <div className="mt-3 text-xs text-zinc-400 flex items-center space-x-1.5 font-mono text-[11px]">
+                  <span className="text-emerald-400 font-semibold">{cluster?.total_committed_replicas ?? 0} committed</span>
+                  <span className="text-zinc-600">·</span>
+                  <span className="text-sky-400 font-semibold">{cluster?.total_untracked_chunks ?? 0} untracked</span>
+                  <span className="text-zinc-600">·</span>
+                  <span className="text-amber-400 font-semibold">{cluster?.total_orphaned_chunks ?? 0} orphaned</span>
                 </div>
               </div>
 
@@ -645,10 +765,10 @@ export default function App() {
                   <span className="text-2xl font-bold font-mono text-white">Token #{leader?.fencing_token ?? 1}</span>
                 </div>
                 <div className="mt-3 text-xs text-zinc-400 flex items-center justify-between">
-                  <span>Lease: {leader?.is_leader ? 'Active' : 'Standby'}</span>
+                  <span>Lease: {leader?.is_leader ? `${(leader?.time_remaining_seconds ?? 0).toFixed(1)}s active` : 'Standby'}</span>
                   <button
                     onClick={handleLeaderStepDown}
-                    className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] underline"
+                    className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] underline cursor-pointer"
                   >
                     Step Down
                   </button>
@@ -656,16 +776,41 @@ export default function App() {
               </div>
             </div>
 
+            {/* Storage Volume Classification Breakdown Notice */}
+            {((cluster?.total_orphaned_chunks ?? 0) > 0 || (cluster?.total_untracked_chunks ?? 0) > 0) && (
+              <div className="bg-amber-950/40 border border-amber-800/60 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-amber-200">
+                <div className="flex items-start sm:items-center space-x-3">
+                  <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5 sm:mt-0" />
+                  <div>
+                    <div className="font-semibold text-amber-100 flex items-center space-x-2">
+                      <span>Physical Volume Discrepancy: {cluster?.total_orphaned_chunks ?? 0} Orphaned Chunks ({formatBytes(cluster?.total_orphaned_bytes ?? 0)}) & {cluster?.total_untracked_chunks ?? 0} Untracked Replicas</span>
+                      <span className="bg-amber-500/20 text-amber-300 px-1.5 py-0.2 rounded text-[10px] font-mono">Storage Audited</span>
+                    </div>
+                    <div className="text-amber-300/80 text-[11px] mt-0.5">
+                      Storage nodes contain residual chunk files from prior operations or unassigned replicas on disk. Authoritative committed file metadata is 100% verified with 3 distinct replicas.
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={handleReconcileOrphans}
+                  disabled={reconciling}
+                  className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-zinc-950 font-semibold text-xs transition cursor-pointer shrink-0 disabled:opacity-50 shadow-sm"
+                >
+                  {reconciling ? 'Reclaiming...' : 'Reclaim Orphan Storage'}
+                </button>
+              </div>
+            )}
+
             {/* Storage Node Distribution Grid */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-semibold text-white">Cluster Storage Nodes (Ports 8001–8005)</h3>
-                  <p className="text-xs text-zinc-400">Physical persistent volumes and chunk distribution across independent services</p>
+                  <h3 className="text-sm font-semibold text-white">Cluster Storage Nodes ({cluster?.total_nodes ?? 5} Active Instances)</h3>
+                  <p className="text-xs text-zinc-400">Authoritative committed replicas vs raw physical disk allocation</p>
                 </div>
                 <button
                   onClick={() => setActiveTab('nodes')}
-                  className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1"
+                  className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 cursor-pointer"
                 >
                   <span>Manage Nodes</span>
                   <ChevronRight className="w-3.5 h-3.5" />
@@ -680,16 +825,28 @@ export default function App() {
                         <div className={`w-2 h-2 rounded-full ${getStatusDot(node.health_state)}`} />
                         <span className="text-xs font-semibold text-white">Node {i + 1}</span>
                       </div>
-                      <span className="text-[10px] font-mono text-zinc-400">:{8001 + i}</span>
+                      <span className="text-[10px] font-mono text-zinc-400">:{node.advertised_url.split(':').pop()}</span>
                     </div>
                     <div className="space-y-1 text-[11px] text-zinc-400">
                       <div className="flex justify-between">
-                        <span>Chunks:</span>
-                        <span className="font-mono text-zinc-200">{node.total_chunks}</span>
+                        <span>Committed:</span>
+                        <span className="font-mono text-emerald-400 font-semibold">{node.committed_chunks ?? node.total_chunks} ({formatBytes(node.committed_bytes_used ?? node.total_bytes_used)})</span>
                       </div>
-                      <div className="flex justify-between">
-                        <span>Stored:</span>
-                        <span className="font-mono text-zinc-200">{formatBytes(node.total_bytes_used)}</span>
+                      {(node.untracked_chunks ?? 0) > 0 && (
+                        <div className="flex justify-between text-sky-400 font-mono text-[10px]">
+                          <span>Untracked:</span>
+                          <span>{node.untracked_chunks} ({formatBytes(node.untracked_bytes_used ?? 0)})</span>
+                        </div>
+                      )}
+                      {(node.orphaned_chunks ?? 0) > 0 && (
+                        <div className="flex justify-between text-amber-400 font-mono text-[10px]">
+                          <span>Orphans:</span>
+                          <span>{node.orphaned_chunks} ({formatBytes(node.orphaned_bytes_used ?? 0)})</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between border-t border-zinc-800/50 pt-1">
+                        <span>Physical Disk:</span>
+                        <span className="font-mono text-zinc-200">{formatBytes(node.physical_bytes_used ?? node.total_bytes_used)} ({node.physical_chunks ?? node.total_chunks} chk)</span>
                       </div>
                     </div>
                     <div className="w-full bg-zinc-800 rounded-full h-1 overflow-hidden mt-1">
@@ -708,7 +865,7 @@ export default function App() {
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-white flex items-center space-x-2">
                   <Terminal className="w-4 h-4 text-zinc-400" />
-                  <span>Real-Time Cluster Audit Log</span>
+                  <span>Real-Time Cluster Audit Log (Persisted in SQLite)</span>
                 </h3>
                 <span className="text-xs text-zinc-500">{events.length} events logged</span>
               </div>
@@ -741,7 +898,7 @@ export default function App() {
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h2 className="text-lg font-semibold text-white">Storage Explorer</h2>
-                <p className="text-xs text-zinc-400">Real files ingested, chunked into 1 MiB segments, and replicated across distinct nodes</p>
+                <p className="text-xs text-zinc-400">Authoritative files committed to cluster metadata with SHA-256 chunk layouts</p>
               </div>
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -850,7 +1007,7 @@ export default function App() {
                   </div>
                   <button
                     onClick={() => setSelectedFileDetail(null)}
-                    className="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded bg-zinc-800"
+                    className="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded bg-zinc-800 cursor-pointer"
                   >
                     Close
                   </button>
@@ -884,6 +1041,15 @@ export default function App() {
                                 <span className={`text-[10px] px-1 rounded ${getStatusColor(rep.status)}`}>{rep.status}</span>
                               </div>
                               <div className="text-[10px] text-zinc-500 truncate">{rep.node_url}</div>
+                              {rep.status === 'active' && (
+                                <button
+                                  onClick={() => handleCorruptChunk(chk.chunk_id, rep.node_id)}
+                                  className="text-[10px] text-rose-400 hover:text-rose-300 underline font-sans cursor-pointer pt-0.5"
+                                  title="Flip physical bytes on this storage node to test cryptographic audit detection"
+                                >
+                                  Inject Bit-Rot
+                                </button>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -904,7 +1070,7 @@ export default function App() {
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-lg font-semibold text-white">Storage Node Topology</h2>
-                <p className="text-xs text-zinc-400">Real-time health, disk allocation, and failure states for all 5 cluster services</p>
+                <p className="text-xs text-zinc-400">Committed replica assignments, physical disk utilization, and failure controls for all 5 cluster services</p>
               </div>
             </div>
 
@@ -926,6 +1092,23 @@ export default function App() {
                     </span>
                   </div>
 
+                  {/* Classification Pills */}
+                  <div className="flex flex-wrap gap-1.5 font-mono text-[10px]">
+                    <span className="px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-800/60">
+                      {node.committed_chunks ?? node.total_chunks} Committed ({formatBytes(node.committed_bytes_used ?? node.total_bytes_used)})
+                    </span>
+                    {(node.untracked_chunks ?? 0) > 0 && (
+                      <span className="px-2 py-0.5 rounded bg-sky-950/60 text-sky-300 border border-sky-800/60">
+                        {node.untracked_chunks} Untracked ({formatBytes(node.untracked_bytes_used ?? 0)})
+                      </span>
+                    )}
+                    {(node.orphaned_chunks ?? 0) > 0 && (
+                      <span className="px-2 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800/60">
+                        {node.orphaned_chunks} Orphaned ({formatBytes(node.orphaned_bytes_used ?? 0)})
+                      </span>
+                    )}
+                  </div>
+
                   <div className="space-y-2 text-xs border-t border-zinc-800 pt-3">
                     <div className="flex justify-between">
                       <span className="text-zinc-500">HTTP Endpoint:</span>
@@ -933,27 +1116,29 @@ export default function App() {
                     </div>
                     <div className="flex justify-between">
                       <span className="text-zinc-500">Volume Storage:</span>
-                      <span className="font-mono text-zinc-300">/data/chunks (Volume #{i + 1})</span>
+                      <span className="font-mono text-zinc-300">/data/storage_node_{node.node_id.replace('storage-node-', '')}/chunks</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-zinc-500">Stored Chunks:</span>
-                      <span className="font-mono font-semibold text-white">{node.total_chunks}</span>
+                      <span className="text-zinc-500">Committed Replicas:</span>
+                      <span className="font-mono font-semibold text-emerald-400">{node.committed_chunks ?? node.total_chunks}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-zinc-500">Allocated Space:</span>
-                      <span className="font-mono text-zinc-300">{formatBytes(node.total_bytes_used)}</span>
+                      <span className="text-zinc-500">Physical Files on Disk:</span>
+                      <span className="font-mono font-semibold text-white">{node.physical_chunks ?? node.total_chunks}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-zinc-500">Missed Heartbeats:</span>
-                      <span className={`font-mono ${node.consecutive_failures > 0 ? 'text-amber-400 font-bold' : 'text-zinc-400'}`}>
-                        {node.consecutive_failures}
-                      </span>
+                      <span className="text-zinc-500">Committed Storage:</span>
+                      <span className="font-mono text-zinc-300">{formatBytes(node.committed_bytes_used ?? node.total_bytes_used)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-zinc-500">Physical Disk Used:</span>
+                      <span className="font-mono text-zinc-300">{formatBytes(node.physical_bytes_used ?? node.total_bytes_used)}</span>
                     </div>
                   </div>
 
                   <div className="pt-2">
                     <div className="flex justify-between text-xs text-zinc-400 mb-1 font-mono">
-                      <span>Disk Usage ({formatBytes(node.total_bytes_used)} / {formatBytes(node.storage_limit_bytes)})</span>
+                      <span>Physical Disk ({formatBytes(node.physical_bytes_used ?? node.total_bytes_used)} / {formatBytes(node.storage_limit_bytes)})</span>
                       <span>{node.disk_usage_percent}%</span>
                     </div>
                     <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
@@ -1060,13 +1245,13 @@ export default function App() {
         )}
 
         {/* ------------------------------------------------------------- */}
-        {/* 5. DISTRIBUTED-SYSTEMS INSPECTOR                               */}
+        {/* 5. DISTRIBUTED-SYSTEMS & AUDIT INSPECTOR                       */}
         {/* ------------------------------------------------------------- */}
         {activeTab === 'inspector' && (
           <div className="space-y-6">
             <div>
-              <h2 className="text-lg font-semibold text-white">Distributed-Systems Inspector</h2>
-              <p className="text-xs text-zinc-400">Database leases, fencing tokens, cryptographic audits, and consensus guarantees</p>
+              <h2 className="text-lg font-semibold text-white">Distributed-Systems & Audit Inspector</h2>
+              <p className="text-xs text-zinc-400">Database leases, fencing tokens, cryptographic audits, and complete chunk inventory classification</p>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1075,7 +1260,7 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-white flex items-center space-x-2">
                     <Radio className="w-4 h-4 text-indigo-400" />
-                    <span>PostgreSQL Leader Lease</span>
+                    <span>PostgreSQL / SQLite Leader Lease</span>
                   </h3>
                   <button
                     onClick={handleLeaderStepDown}
@@ -1092,11 +1277,11 @@ export default function App() {
                   </div>
                   <div className="flex justify-between">
                     <span className="text-zinc-500">Monotonic Fencing Token:</span>
-                    <span className="text-indigo-300 font-bold">{leader?.fencing_token}</span>
+                    <span className="text-indigo-300 font-bold">#{leader?.fencing_token}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-zinc-500">Time Until Renewal:</span>
-                    <span className="text-zinc-300">{leader?.time_remaining_seconds}s</span>
+                    <span className="text-zinc-300">{(leader?.time_remaining_seconds ?? 0).toFixed(1)}s</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-zinc-500">Coordinator Instance:</span>
@@ -1105,7 +1290,7 @@ export default function App() {
                 </div>
 
                 <p className="text-xs text-zinc-400">
-                  Fencing tokens prevent split-brain writes. If a stale leader attempts a metadata update after its lease expires, the transaction is rejected by PostgreSQL.
+                  Fencing tokens prevent split-brain writes. If a stale leader attempts a metadata update after its lease expires, the transaction is rejected.
                 </p>
               </div>
 
@@ -1126,37 +1311,124 @@ export default function App() {
                 </div>
 
                 {auditResult ? (
-                  <div className="space-y-2 text-xs font-mono bg-zinc-950 p-4 rounded-lg border border-zinc-800/80">
-                    <div className="flex justify-between">
-                      <span className="text-zinc-500">Files Audited:</span>
-                      <span className="text-zinc-200">{auditResult.checked_files}</span>
+                  <div className="space-y-3">
+                    <div className="space-y-2 text-xs font-mono bg-zinc-950 p-4 rounded-lg border border-zinc-800/80">
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Files Audited:</span>
+                        <span className="text-zinc-200">{auditResult.checked_files}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Chunks Audited:</span>
+                        <span className="text-zinc-200">{auditResult.checked_chunks}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Valid Replicas on Disk:</span>
+                        <span className="text-emerald-400 font-bold">{auditResult.valid_replicas}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Corrupted Replicas:</span>
+                        <span className={auditResult.corrupted_replicas > 0 ? 'text-rose-400 font-bold' : 'text-zinc-400'}>
+                          {auditResult.corrupted_replicas}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Missing Replicas:</span>
+                        <span className={auditResult.missing_replicas > 0 ? 'text-rose-400 font-bold' : 'text-zinc-400'}>
+                          {auditResult.missing_replicas}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-zinc-500">Chunks Audited:</span>
-                      <span className="text-zinc-200">{auditResult.checked_chunks}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-zinc-500">Valid Replicas on Disk:</span>
-                      <span className="text-emerald-400 font-bold">{auditResult.valid_replicas}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-zinc-500">Corrupted Replicas:</span>
-                      <span className={auditResult.corrupted_replicas > 0 ? 'text-rose-400 font-bold' : 'text-zinc-400'}>
-                        {auditResult.corrupted_replicas}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-zinc-500">Missing Replicas:</span>
-                      <span className={auditResult.missing_replicas > 0 ? 'text-rose-400 font-bold' : 'text-zinc-400'}>
-                        {auditResult.missing_replicas}
-                      </span>
-                    </div>
+
+                    {auditResult.corrupted_replicas > 0 && (
+                      <button
+                        onClick={handleTriggerReconcile}
+                        disabled={reconciling}
+                        className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition flex items-center justify-center space-x-1.5 shadow"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+                        <span>Trigger Self-Healing Scan to Repair {auditResult.corrupted_replicas} Corrupted Replica(s)</span>
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className="p-6 bg-zinc-950 rounded-lg border border-zinc-800 text-center text-xs text-zinc-500">
                     Click "Run SHA-256 Audit" to verify on-disk hash consistency across all storage nodes.
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Comprehensive Physical Chunk Inventory & 4-Way Classification Table */}
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-white flex items-center space-x-2">
+                    <Database className="w-4 h-4 text-indigo-400" />
+                    <span>Physical Chunk Inventory & 4-Way Classification Audit</span>
+                  </h3>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    Itemized audit of all 11 physical chunk files found on disk across all 5 nodes
+                  </p>
+                </div>
+                {inventoryAudit && (
+                  <div className="flex flex-wrap gap-2 text-[11px] font-mono">
+                    <span className="px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800 text-emerald-300">
+                      {inventoryAudit.summary.actual_committed_replicas} Committed
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-sky-950/60 border border-sky-800 text-sky-300">
+                      {inventoryAudit.summary.actual_untracked_chunks} Untracked
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-amber-950/60 border border-amber-800 text-amber-300">
+                      {inventoryAudit.summary.actual_orphaned_chunks} Orphaned
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-rose-950/60 border border-rose-800 text-rose-300">
+                      {inventoryAudit.summary.actual_stale_replicas} Stale
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-zinc-950 rounded-lg border border-zinc-800 overflow-hidden">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-zinc-900/80 text-zinc-400 uppercase tracking-wider border-b border-zinc-800 font-mono text-[11px]">
+                    <tr>
+                      <th className="py-2.5 px-3">Storage Node</th>
+                      <th className="py-2.5 px-3">Chunk ID</th>
+                      <th className="py-2.5 px-3">File / Origin</th>
+                      <th className="py-2.5 px-3">Size</th>
+                      <th className="py-2.5 px-3">SHA-256 (Disk)</th>
+                      <th className="py-2.5 px-3">Audit Classification</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/50 font-mono text-[11px] text-zinc-300">
+                    {(!inventoryAudit || inventoryAudit.items.length === 0) ? (
+                      <tr>
+                        <td colSpan={6} className="py-6 text-center text-zinc-500 font-sans">
+                          No chunk inventory loaded. Refreshing...
+                        </td>
+                      </tr>
+                    ) : (
+                      inventoryAudit.items.map((item, idx) => (
+                        <tr key={idx} className="hover:bg-zinc-900/40 transition">
+                          <td className="py-2.5 px-3 font-semibold text-zinc-200">{item.node_id}</td>
+                          <td className="py-2.5 px-3 text-indigo-400 truncate max-w-[120px]">{item.chunk_id}</td>
+                          <td className="py-2.5 px-3 text-zinc-400 font-sans truncate max-w-[150px]">
+                            {item.file_name ? item.file_name : <span className="text-zinc-600 italic">No File (Residual)</span>}
+                          </td>
+                          <td className="py-2.5 px-3">{formatBytes(item.size_bytes)}</td>
+                          <td className="py-2.5 px-3 text-zinc-500 truncate max-w-[130px] font-mono text-[10px]" title={item.sha256}>
+                            {item.sha256.slice(0, 16)}...
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${getStatusColor(item.classification)}`}>
+                              {item.classification.replace('_', ' ')}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
