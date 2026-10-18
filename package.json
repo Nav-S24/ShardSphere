@@ -1,5 +1,5 @@
 {
-  "name": "react-example",
+  "name": "shardsphere",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -9,6 +9,8 @@
     "start": "node server.ts",
     "test": "tsx tests/cluster_integration.test.ts",
     "test:audit": "tsx tests/audit_consistency_regression.test.ts",
+    "test:coverage": "tsx tests/missing_coverage_regression.test.ts",
+    "test:all": "tsx tests/cluster_integration.test.ts && tsx tests/audit_consistency_regression.test.ts && tsx tests/missing_coverage_regression.test.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

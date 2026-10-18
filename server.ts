@@ -1,3 +1,4 @@
+import http from 'http';
 import express, { Request, Response } from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
@@ -407,6 +408,51 @@ setInterval(() => {
   `).run(now);
 }, 1000);
 
+// Modular Orphan Reclamation function (reusable for isolated testing and cluster route)
+export function reclaimOrphanChunks(
+  database: any = db,
+  getChunksDir: (nodeId: string) => string = getNodeChunksDir
+): { total_purged_orphans: number; total_reclaimed_bytes: number } {
+  let totalPurged = 0;
+  let totalReclaimed = 0;
+  const nodes = database.prepare('SELECT * FROM storage_nodes').all() as any[];
+
+  for (const node of nodes) {
+    const dir = getChunksDir(node.node_id);
+    if (!fs.existsSync(dir)) continue;
+
+    const diskFiles = fs.readdirSync(dir);
+    for (const fname of diskFiles) {
+      if (fname.endsWith('.bin')) {
+        const chunkId = fname.replace(/^chunk_/, '').replace(/\.bin$/, '');
+        const binPath = path.join(dir, fname);
+        const metaPath = path.join(dir, `chunk_${chunkId}.meta.json`);
+
+        const chunkRec = database.prepare(`
+          SELECT c.*, f.status as file_status
+          FROM chunks c
+          JOIN files f ON c.file_id = f.file_id
+          WHERE c.chunk_id = ?
+        `).get(chunkId) as any;
+
+        if (!chunkRec || (chunkRec.file_status !== 'committed' && chunkRec.file_status !== 'degraded')) {
+          try {
+            const sz = fs.statSync(binPath).size;
+            fs.unlinkSync(binPath);
+            if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+            totalPurged++;
+            totalReclaimed += sz;
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  }
+
+  return { total_purged_orphans: totalPurged, total_reclaimed_bytes: totalReclaimed };
+}
+
 // ==========================================
 // Express Application & API Setup
 // ==========================================
@@ -746,6 +792,39 @@ async function startServer() {
     });
   });
 
+  // Set Node Storage Limit (Quota configuration)
+  apiRouter.post('/nodes/:node_id/limit', (req, res) => {
+    const { node_id } = req.params;
+    const { storage_limit_bytes } = req.body || {};
+    if (typeof storage_limit_bytes !== 'number' || storage_limit_bytes < 0) {
+      return res.status(400).json({ detail: 'storage_limit_bytes must be a non-negative number' });
+    }
+    const node = db.prepare('SELECT * FROM storage_nodes WHERE node_id = ?').get(node_id) as any;
+    if (!node) {
+      return res.status(404).json({ detail: `Node ${node_id} not found` });
+    }
+
+    db.prepare('UPDATE storage_nodes SET storage_limit_bytes = ?, updated_at = ? WHERE node_id = ?').run(
+      storage_limit_bytes,
+      Date.now() / 1000,
+      node_id
+    );
+    refreshNodeMetrics();
+
+    addEvent(
+      'NODE_LIMIT_CHANGED',
+      'INFO',
+      `Operator updated storage limit on '${node_id}' to ${storage_limit_bytes} bytes.`,
+      node_id
+    );
+
+    res.json({
+      node_id,
+      storage_limit_bytes,
+      message: `Storage limit updated to ${storage_limit_bytes} bytes`,
+    });
+  });
+
   // Returning Node Reconciliation & Orphan Chunk Purge
   apiRouter.post('/nodes/:node_id/reconcile', (req, res) => {
     const { node_id } = req.params;
@@ -858,54 +937,19 @@ async function startServer() {
 
   // Cluster-Wide Orphan Purge & Garbage Collection
   apiRouter.post('/cluster/reconcile-orphans', (_req, res) => {
-    let totalPurged = 0;
-    let totalReclaimed = 0;
-    const nodes = db.prepare('SELECT * FROM storage_nodes').all() as any[];
-
-    for (const node of nodes) {
-      const dir = getNodeChunksDir(node.node_id);
-      if (!fs.existsSync(dir)) continue;
-
-      const diskFiles = fs.readdirSync(dir);
-      for (const fname of diskFiles) {
-        if (fname.endsWith('.bin')) {
-          const chunkId = fname.replace(/^chunk_/, '').replace(/\.bin$/, '');
-          const binPath = path.join(dir, fname);
-          const metaPath = path.join(dir, `chunk_${chunkId}.meta.json`);
-
-          const chunkRec = db.prepare(`
-            SELECT c.*, f.status as file_status
-            FROM chunks c
-            JOIN files f ON c.file_id = f.file_id
-            WHERE c.chunk_id = ?
-          `).get(chunkId) as any;
-
-          if (!chunkRec || (chunkRec.file_status !== 'committed' && chunkRec.file_status !== 'degraded')) {
-            try {
-              const sz = fs.statSync(binPath).size;
-              fs.unlinkSync(binPath);
-              if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
-              totalPurged++;
-              totalReclaimed += sz;
-            } catch {
-              // ignore
-            }
-          }
-        }
-      }
-    }
+    const { total_purged_orphans, total_reclaimed_bytes } = reclaimOrphanChunks(db, getNodeChunksDir);
 
     refreshNodeMetrics();
 
     addEvent(
       'CLUSTER_GARBAGE_COLLECTED',
       'INFO',
-      `Cluster garbage collection pass reclaimed ${(totalReclaimed / 1024).toFixed(1)} KB across storage nodes (${totalPurged} orphan chunks purged).`
+      `Cluster garbage collection pass reclaimed ${(total_reclaimed_bytes / 1024).toFixed(1)} KB across storage nodes (${total_purged_orphans} orphan chunks purged).`
     );
 
     res.json({
-      total_purged_orphans: totalPurged,
-      total_reclaimed_bytes: totalReclaimed,
+      total_purged_orphans,
+      total_reclaimed_bytes,
       timestamp: Date.now() / 1000,
     });
   });
@@ -1209,45 +1253,80 @@ async function startServer() {
   });
 
   // File Upload
-  apiRouter.post('/files', upload.single('file'), (req: Request, res: Response) => {
-    if (!req.file) {
-      return res.status(400).json({ detail: 'No file uploaded' });
-    }
-
-    const buffer = req.file.buffer;
-    const filename = req.file.originalname || 'unnamed_file';
-    const contentType = req.file.mimetype || 'application/octet-stream';
-    const totalSize = buffer.length;
-    const fileSha256 = computeSha256(buffer);
-    const now = Date.now() / 1000;
-    const fileId = `file_${crypto.randomBytes(16).toString('hex')}`;
-
-    // Split into 1 MiB chunks
-    const chunkTuples: { seq: number; data: Buffer; sha: string }[] = [];
-    let seq = 0;
-    for (let offset = 0; offset < totalSize; offset += DEFAULT_CHUNK_SIZE) {
-      const slice = buffer.subarray(offset, Math.min(totalSize, offset + DEFAULT_CHUNK_SIZE));
-      chunkTuples.push({
-        seq,
-        data: slice,
-        sha: computeSha256(slice),
+  apiRouter.post(
+    '/files',
+    (req: Request, res: Response, next) => {
+      (upload.single('file') as any)(req, res, (err: any) => {
+        if (err) {
+          if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(413).json({ detail: 'File exceeds maximum upload size limit (50 MB)' });
+          }
+          return res.status(400).json({ detail: err.message || 'File upload error' });
+        }
+        next();
       });
-      seq++;
-    }
+    },
+    (req: Request, res: Response) => {
+      if (!req.file) {
+        return res.status(400).json({ detail: 'No file uploaded' });
+      }
 
-    const healthyNodes = db.prepare("SELECT * FROM storage_nodes WHERE health_state = 'HEALTHY'").all() as any[];
+      const buffer = req.file.buffer;
+      const filename = req.file.originalname || 'unnamed_file';
+      const contentType = req.file.mimetype || 'application/octet-stream';
+      const totalSize = buffer.length;
+      const fileSha256 = computeSha256(buffer);
+      const now = Date.now() / 1000;
+      const fileId = `file_${crypto.randomBytes(16).toString('hex')}`;
 
-    if (healthyNodes.length < REPLICATION_FACTOR) {
-      return res.status(500).json({
-        detail: `Not enough healthy nodes: needed ${REPLICATION_FACTOR}, found ${healthyNodes.length}`,
-      });
-    }
+      // Split into 1 MiB chunks
+      const chunkTuples: { seq: number; data: Buffer; sha: string }[] = [];
+      let seq = 0;
+      for (let offset = 0; offset < totalSize; offset += DEFAULT_CHUNK_SIZE) {
+        const slice = buffer.subarray(offset, Math.min(totalSize, offset + DEFAULT_CHUNK_SIZE));
+        chunkTuples.push({
+          seq,
+          data: slice,
+          sha: computeSha256(slice),
+        });
+        seq++;
+      }
 
-    // Insert file metadata
-    db.prepare(`
-      INSERT INTO files (file_id, filename, content_type, size_bytes, checksum_sha256, chunk_count, chunk_size_bytes, replication_factor, metadata_version, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?, ?)
-    `).run(fileId, filename, contentType, totalSize, fileSha256, chunkTuples.length, DEFAULT_CHUNK_SIZE, REPLICATION_FACTOR, now, now);
+      const healthyNodes = db.prepare("SELECT * FROM storage_nodes WHERE health_state = 'HEALTHY'").all() as any[];
+
+      if (healthyNodes.length < REPLICATION_FACTOR) {
+        return res.status(500).json({
+          detail: `Not enough healthy nodes: needed ${REPLICATION_FACTOR}, found ${healthyNodes.length}`,
+        });
+      }
+
+      // Check storage quota across target nodes before writing any chunks or metadata
+      const projectedUsage = new Map<string, number>();
+      for (const node of healthyNodes) {
+        const inv = getNodeInventory(node.node_id);
+        projectedUsage.set(node.node_id, inv.physical_bytes_used);
+      }
+
+      for (let i = 0; i < chunkTuples.length; i++) {
+        const ct = chunkTuples[i];
+        for (let r = 0; r < REPLICATION_FACTOR; r++) {
+          const node = healthyNodes[(i + r) % healthyNodes.length];
+          const current = projectedUsage.get(node.node_id) || 0;
+          const updated = current + ct.data.length;
+          if (updated > node.storage_limit_bytes) {
+            return res.status(507).json({
+              detail: `Storage quota exceeded on node '${node.node_id}': projected ${updated} bytes exceeds limit of ${node.storage_limit_bytes} bytes.`,
+            });
+          }
+          projectedUsage.set(node.node_id, updated);
+        }
+      }
+
+      // Insert file metadata
+      db.prepare(`
+        INSERT INTO files (file_id, filename, content_type, size_bytes, checksum_sha256, chunk_count, chunk_size_bytes, replication_factor, metadata_version, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?, ?)
+      `).run(fileId, filename, contentType, totalSize, fileSha256, chunkTuples.length, DEFAULT_CHUNK_SIZE, REPLICATION_FACTOR, now, now);
 
     // Distribute replicas evenly across healthy nodes
     for (let i = 0; i < chunkTuples.length; i++) {
@@ -1479,6 +1558,8 @@ async function startServer() {
   app.use('/api/v1', apiRouter);
   app.use('/api', apiRouter);
 
+  const httpServer = http.createServer(app);
+
   // Mount Vite or static dist in production
   if (process.env.NODE_ENV === 'production') {
     const distPath = path.resolve(__dirname, 'dist');
@@ -1487,14 +1568,18 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: isHmrDisabled ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, HOST, () => {
+  httpServer.listen(PORT, HOST, () => {
     console.log(`ShardSphere Server listening on http://${HOST}:${PORT}`);
   });
 }

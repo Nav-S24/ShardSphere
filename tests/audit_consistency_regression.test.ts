@@ -175,7 +175,7 @@ async function runRegressionAuditTests() {
   assert.strictEqual(verifyData.corrupted_replicas, 0);
 
   // Check audit events
-  const eventsRes = await fetch(`${BASE_URL}/api/v1/events?limit=20`);
+  const eventsRes = await fetch(`${BASE_URL}/api/v1/events?limit=100`);
   assert.strictEqual(eventsRes.status, 200);
   const events = await eventsRes.json();
   assert.ok(events.length > 0, 'Audit events must be recorded in SQLite');
