@@ -1,5 +1,6 @@
 import http from 'http';
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -1557,6 +1558,20 @@ async function startServer() {
   // Mount API router
   app.use('/api/v1', apiRouter);
   app.use('/api', apiRouter);
+
+  // Catch unmatched API routes and return JSON 404 so Vite never returns index.html for API requests
+  app.all(['/api', '/api/*', '/api/v1/*'], (_req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+  });
+
+  // API error handler returning JSON instead of HTML
+  app.use((err: any, req: Request, res: Response, next: any) => {
+    if (req.path.startsWith('/api')) {
+      console.error('API Error:', err);
+      return res.status(500).json({ error: err?.message || 'Internal Server Error' });
+    }
+    next(err);
+  });
 
   const httpServer = http.createServer(app);
 
