@@ -59,11 +59,21 @@ interface StorageNodeInfo {
   physical_bytes_used?: number;
   storage_limit_bytes: number;
   disk_usage_percent: number;
+  lamport_clock?: number;
+}
+
+interface ClocksOverview {
+  coordinator: { id: string; clock: number };
+  nodes: { id: string; clock: number }[];
+  highest_observed: number;
+  timestamp: number;
 }
 
 interface ClusterOverview {
   cluster_name: string;
   coordinator_id: string;
+  coordinator_lamport_clock?: number;
+  lamport_clock?: number;
   is_leader: boolean;
   fencing_token: number;
   total_nodes: number;
@@ -109,6 +119,7 @@ interface FileItem {
   status: string;
   metadata_version: number;
   created_at: number;
+  lamport_clock?: number;
 }
 
 interface ReplicaDetail {
@@ -118,6 +129,7 @@ interface ReplicaDetail {
   status: string;
   generation: number;
   last_verified_at: number | null;
+  lamport_clock?: number;
 }
 
 interface ChunkDetail {
@@ -128,6 +140,7 @@ interface ChunkDetail {
   generation: number;
   replicas: ReplicaDetail[];
   healthy_replicas_count: number;
+  lamport_clock?: number;
 }
 
 interface FileDetail {
@@ -143,6 +156,7 @@ interface FileDetail {
   status: string;
   created_at: number;
   updated_at: number;
+  lamport_clock?: number;
   chunks: ChunkDetail[];
 }
 
@@ -158,6 +172,7 @@ interface RecoveryJob {
   error_message: string | null;
   created_at: number;
   completed_at: number | null;
+  lamport_clock?: number;
 }
 
 interface ClusterEvent {
@@ -168,6 +183,11 @@ interface ClusterEvent {
   file_id: string | null;
   message: string;
   timestamp: number;
+  lamport_clock?: number;
+  origin_node_id?: string;
+  causal_parent_id?: string | null;
+  causal_parent_ids?: string[] | null;
+  correlation_id?: string | null;
 }
 
 interface ChunkInventoryItem {
@@ -251,27 +271,33 @@ export default function App() {
   const [labLogs, setLabLogs] = useState<string[]>([]);
   const [labSelectedNode, setLabSelectedNode] = useState<string>('storage-node-2');
 
+  // Lamport Logical Clocks State
+  const [clocks, setClocks] = useState<ClocksOverview | null>(null);
+  const [eventSortOrder, setEventSortOrder] = useState<'deterministic' | 'timestamp'>('deterministic');
+
   // ============================================================================
-  // Telemetry Polling (Unchanged Backend Contract)
+  // Telemetry Polling (Unchanged Backend Contract + Lamport Clock Vector)
   // ============================================================================
   const fetchAllTelemetry = async () => {
     try {
-      const [clusterRes, leaderRes, filesRes, jobsRes, eventsRes, auditRes] = await Promise.all([
+      const [clusterRes, leaderRes, filesRes, jobsRes, eventsRes, auditRes, clocksRes] = await Promise.all([
         fetch('/api/v1/cluster'),
         fetch('/api/v1/leader'),
         fetch('/api/v1/files'),
         fetch('/api/v1/recovery/jobs'),
-        fetch('/api/v1/events?limit=40'),
+        fetch(`/api/v1/events?limit=50&order_by=${eventSortOrder === 'deterministic' ? 'lamport' : 'timestamp'}&direction=desc`),
         fetch('/api/v1/inventory/audit'),
+        fetch('/api/v1/clocks'),
       ]);
 
-      const [cData, lData, fData, jData, eData, aData] = await Promise.all([
+      const [cData, lData, fData, jData, eData, aData, clkData] = await Promise.all([
         safeJson<ClusterOverview>(clusterRes),
         safeJson<LeaderInfo>(leaderRes),
         safeJson<{ files: FileItem[] }>(filesRes),
         safeJson<RecoveryJob[]>(jobsRes),
         safeJson<ClusterEvent[]>(eventsRes),
         safeJson<InventoryAuditResult>(auditRes),
+        safeJson<ClocksOverview>(clocksRes),
       ]);
 
       if (cData) setCluster(cData);
@@ -280,6 +306,7 @@ export default function App() {
       if (jData) setJobs(jData);
       if (eData) setEvents(eData);
       if (aData) setInventoryAudit(aData);
+      if (clkData) setClocks(clkData);
     } catch (err) {
       console.warn('Telemetry polling notice:', err);
     } finally {
@@ -651,7 +678,21 @@ export default function App() {
     f.checksum_sha256.toLowerCase().includes(fileSearchQuery.toLowerCase())
   );
 
-  const filteredEvents = events.filter(e => {
+  const sortedEvents = [...events].sort((a, b) => {
+    if (eventSortOrder === 'deterministic') {
+      const clockA = a.lamport_clock ?? 0;
+      const clockB = b.lamport_clock ?? 0;
+      if (clockB !== clockA) return clockB - clockA;
+      const nodeA = a.origin_node_id || '';
+      const nodeB = b.origin_node_id || '';
+      if (nodeA !== nodeB) return nodeA.localeCompare(nodeB);
+      return a.event_id.localeCompare(b.event_id);
+    } else {
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    }
+  });
+
+  const filteredEvents = sortedEvents.filter(e => {
     if (eventSeverityFilter === 'ALL') return true;
     return e.severity.toUpperCase() === eventSeverityFilter;
   });
@@ -978,6 +1019,75 @@ export default function App() {
               </div>
             </div>
 
+            {/* Lamport Logical Clocks Vector Grid */}
+            <div className="bg-white border border-slate-200/90 rounded-lg p-5 shadow-xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-md bg-indigo-50 border border-indigo-200/80 flex items-center justify-center text-indigo-700">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-semibold text-slate-900">
+                        Lamport Logical Clock Vector Engine
+                      </h3>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                        Highest Observed: L:{clocks?.highest_observed ?? cluster?.coordinator_lamport_clock ?? 0}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Distributed scalar logical clocks enforcing happens-before causal ordering across coordinator and storage node participants.
+                    </p>
+                  </div>
+                </div>
+                <div className="text-xs font-mono text-slate-500 flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
+                  <span>Strictly Monotonic</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-1">
+                {/* Coordinator */}
+                <div className="bg-slate-50/80 border border-indigo-200/80 rounded-md p-3 flex flex-col justify-between">
+                  <div className="flex items-center justify-between text-[11px] font-medium text-slate-500">
+                    <span className="truncate">Coordinator</span>
+                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
+                  </div>
+                  <div className="my-1.5">
+                    <span className="text-xl font-bold font-mono text-indigo-700">
+                      L:{clocks?.coordinator.clock ?? cluster?.coordinator_lamport_clock ?? 0}
+                    </span>
+                  </div>
+                  <div className="text-[10px] font-mono text-slate-400 truncate">
+                    coordinator-primary-1
+                  </div>
+                </div>
+
+                {/* 5 Storage Nodes */}
+                {[1, 2, 3, 4, 5].map((idx) => {
+                  const nodeId = `storage-node-${idx}`;
+                  const nodeObj = cluster?.nodes?.find(n => n.node_id === nodeId);
+                  const nodeClock = clocks?.nodes?.find(n => n.id === nodeId)?.clock ?? nodeObj?.lamport_clock ?? 0;
+                  return (
+                    <div key={nodeId} className="bg-slate-50/60 border border-slate-200 rounded-md p-3 flex flex-col justify-between">
+                      <div className="flex items-center justify-between text-[11px] font-medium text-slate-500">
+                        <span>Node {idx}</span>
+                        <span className={`w-1.5 h-1.5 rounded-full ${nodeObj?.health_state === 'HEALTHY' ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
+                      </div>
+                      <div className="my-1.5">
+                        <span className="text-xl font-bold font-mono text-slate-800">
+                          L:{nodeClock}
+                        </span>
+                      </div>
+                      <div className="text-[10px] font-mono text-slate-400 truncate">
+                        {nodeId}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
             {/* Storage Capacity & Replication Architecture */}
             {(() => {
               const logicalBytes = cluster?.total_bytes_stored ?? 0;
@@ -1174,24 +1284,52 @@ export default function App() {
                     <Terminal className="w-4 h-4 text-slate-500" />
                     <span>Cluster Audit & Event Stream</span>
                   </h3>
-                  <p className="text-xs text-slate-500 mt-0.5">Authoritative events persisted in SQLite metadata</p>
+                  <p className="text-xs text-slate-500 mt-0.5">Authoritative events persisted with deterministic Lamport causal ordering</p>
                 </div>
 
-                {/* Filter Tabs */}
-                <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-md text-xs">
-                  {(['ALL', 'INFO', 'WARNING', 'ERROR'] as const).map(sev => (
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* Lamport Deterministic vs Wall-Clock Toggle */}
+                  <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-md text-xs">
                     <button
-                      key={sev}
-                      onClick={() => setEventSeverityFilter(sev)}
+                      onClick={() => setEventSortOrder('deterministic')}
                       className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                        eventSeverityFilter === sev
-                          ? 'bg-white text-slate-900 shadow-xs'
+                        eventSortOrder === 'deterministic'
+                          ? 'bg-white text-indigo-700 font-semibold shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
+                      title="Sort deterministically by (Lamport Clock, Origin Node, Event ID)"
                     >
-                      {sev}
+                      Lamport Order
                     </button>
-                  ))}
+                    <button
+                      onClick={() => setEventSortOrder('timestamp')}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                        eventSortOrder === 'timestamp'
+                          ? 'bg-white text-slate-900 font-semibold shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                      title="Sort by physical wall-clock timestamp"
+                    >
+                      Wall-Clock
+                    </button>
+                  </div>
+
+                  {/* Filter Tabs */}
+                  <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-md text-xs">
+                    {(['ALL', 'INFO', 'WARNING', 'ERROR'] as const).map(sev => (
+                      <button
+                        key={sev}
+                        onClick={() => setEventSeverityFilter(sev)}
+                        className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                          eventSeverityFilter === sev
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {sev}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -1200,16 +1338,42 @@ export default function App() {
                   <div className="p-6 text-center text-slate-400">No events found matching current criteria.</div>
                 ) : (
                   filteredEvents.map((ev) => (
-                    <div key={ev.event_id} className="p-2.5 px-3 flex items-start gap-3 hover:bg-slate-50 transition-colors">
-                      <span className="text-[11px] font-mono text-slate-400 shrink-0 mt-0.5">
+                    <div key={ev.event_id} className="p-2.5 px-3 flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 hover:bg-slate-50 transition-colors">
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {/* Lamport Clock Badge */}
+                        <span className="font-mono text-[11px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200/90 px-1.5 py-0.5 rounded shadow-2xs" title={`Lamport Logical Timestamp: L:${ev.lamport_clock ?? 0}`}>
+                          L:{ev.lamport_clock ?? 0}
+                        </span>
+                        {/* Origin Node Badge */}
+                        <span className="font-mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200/70 px-1.5 py-0.5 rounded shrink-0">
+                          {ev.origin_node_id || 'coordinator-primary-1'}
+                        </span>
+                        <span className="shrink-0">{getSemanticBadge(ev.severity)}</span>
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-[11px] font-semibold text-slate-800">
+                            {ev.event_type}
+                          </span>
+                          {ev.causal_parent_id && (
+                            <span className="text-[10px] font-mono text-purple-700 bg-purple-50 border border-purple-200/60 px-1.5 py-0.2 rounded flex items-center gap-0.5" title={`Causal Parent Event: ${ev.causal_parent_id}`}>
+                              <CornerDownRight className="w-2.5 h-2.5" /> caused by: {ev.causal_parent_id.slice(-8)}
+                            </span>
+                          )}
+                          {ev.correlation_id && (
+                            <span className="text-[10px] font-mono text-slate-400" title={`Correlation ID: ${ev.correlation_id}`}>
+                              corr: {ev.correlation_id.slice(0, 10)}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-slate-600 text-xs mt-0.5 break-words">
+                          {ev.message}
+                        </p>
+                      </div>
+
+                      <span className="text-[10px] font-mono text-slate-400 shrink-0 self-start sm:self-center">
                         {new Date(ev.timestamp * 1000).toLocaleTimeString()}
-                      </span>
-                      <span className="shrink-0">{getSemanticBadge(ev.severity)}</span>
-                      <span className="font-mono text-[11px] font-semibold text-slate-700 shrink-0">
-                        {ev.event_type}
-                      </span>
-                      <span className="text-slate-600 text-xs flex-1 break-words">
-                        {ev.message}
                       </span>
                     </div>
                   ))
@@ -1346,6 +1510,9 @@ export default function App() {
                     <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
                       <Layers className="w-4 h-4 text-[#4f56c7]" />
                       <span>Physical Chunk Placement: {selectedFileDetail.filename}</span>
+                      <span className="font-mono text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded ml-2">
+                        Commit L:{selectedFileDetail.lamport_clock ?? 0}
+                      </span>
                     </h3>
                     <p className="text-xs text-slate-500 font-mono mt-0.5">
                       File ID: {selectedFileDetail.file_id} · Metadata Version: v{selectedFileDetail.metadata_version} · Hash: {selectedFileDetail.checksum_sha256}
@@ -1363,9 +1530,14 @@ export default function App() {
                   {selectedFileDetail.chunks.map((chk) => (
                     <div key={chk.chunk_id} className="bg-slate-50 p-4 rounded-md border border-slate-200/90 space-y-2.5">
                       <div className="flex items-center justify-between text-xs">
-                        <span className="font-semibold text-slate-900 font-mono">
-                          Chunk #{chk.sequence_index} ({chk.chunk_id})
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-slate-900 font-mono">
+                            Chunk #{chk.sequence_index} ({chk.chunk_id})
+                          </span>
+                          <span className="font-mono text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200/80 px-1.5 py-0.2 rounded">
+                            L:{chk.lamport_clock ?? 0}
+                          </span>
+                        </div>
                         <span className="font-mono text-slate-600">
                           {formatBytes(chk.size_bytes)} ({chk.size_bytes} bytes)
                         </span>
@@ -1387,7 +1559,10 @@ export default function App() {
                                 <span className="font-semibold text-slate-800">{rep.node_id}</span>
                                 {getSemanticBadge(rep.status)}
                               </div>
-                              <div className="text-[10px] text-slate-400 truncate">{rep.node_url}</div>
+                              <div className="text-[10px] text-slate-400 truncate flex items-center justify-between">
+                                <span>{rep.node_url}</span>
+                                <span className="text-indigo-600 font-mono font-medium">L:{rep.lamport_clock ?? 0}</span>
+                              </div>
                               {rep.status === 'active' && (
                                 <button
                                   onClick={() => handleCorruptChunk(chk.chunk_id, rep.node_id)}
@@ -1468,6 +1643,15 @@ export default function App() {
                       <div className="flex justify-between">
                         <span className="text-slate-400">Storage Path:</span>
                         <span className="font-mono text-slate-600 text-[11px]">/data/storage_node_{node.node_id.replace('storage-node-', '')}/chunks</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-indigo-50/70 px-2 py-1 rounded border border-indigo-100">
+                        <span className="text-indigo-900 font-medium flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-indigo-600" />
+                          <span>Lamport Clock:</span>
+                        </span>
+                        <span className="font-mono font-bold text-indigo-700">
+                          L: {node.lamport_clock ?? clocks?.nodes?.find(n => n.id === node.node_id)?.clock ?? 0}
+                        </span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-slate-400">Committed Replicas:</span>
@@ -1701,6 +1885,10 @@ export default function App() {
                         <span className={auditResult.missing_replicas > 0 ? 'text-rose-600 font-bold' : 'text-slate-600'}>
                           {auditResult.missing_replicas}
                         </span>
+                      </div>
+                      <div className="flex justify-between border-t border-slate-200/80 pt-1.5 mt-1.5">
+                        <span className="text-indigo-900 font-medium">Audit Lamport Clock:</span>
+                        <span className="text-indigo-700 font-bold">L: {auditResult.lamport_clock ?? 0}</span>
                       </div>
                     </div>
 

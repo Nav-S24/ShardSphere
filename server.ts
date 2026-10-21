@@ -8,6 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { DatabaseSync } from 'node:sqlite';
+import { LamportClockEngine, COORDINATOR_PARTICIPANT_ID, type CausalEventEnvelope } from './src/clock/index.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -121,6 +122,11 @@ db.exec(`
   );
 `);
 
+// ==========================================
+// Lamport Logical Clock Engine Initialization
+// ==========================================
+export const clockEngine = new LamportClockEngine(db);
+
 // Seed storage_nodes if table is empty
 const existingNodesCount = (db.prepare('SELECT count(*) as count FROM storage_nodes').get() as any).count;
 if (existingNodesCount === 0) {
@@ -178,17 +184,47 @@ function addEvent(
   severity: 'INFO' | 'WARNING' | 'ERROR',
   message: string,
   nodeId: string | null = null,
-  fileId: string | null = null
-) {
-  const eventId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const ts = Date.now() / 1000;
+  fileId: string | null = null,
+  options?: {
+    origin_node_id?: string;
+    causal_parent_id?: string | null;
+    causal_parent_ids?: string[] | null;
+    correlation_id?: string | null;
+    received_clock?: number;
+  }
+): CausalEventEnvelope {
   try {
-    db.prepare(`
-      INSERT INTO cluster_events (event_id, event_type, severity, node_id, file_id, message, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(eventId, eventType, severity, nodeId, fileId, message, ts);
+    return clockEngine.recordCausalEvent({
+      origin_node_id: options?.origin_node_id || COORDINATOR_PARTICIPANT_ID,
+      event_type: eventType,
+      severity,
+      message,
+      node_id: nodeId,
+      file_id: fileId,
+      causal_parent_id: options?.causal_parent_id,
+      causal_parent_ids: options?.causal_parent_ids,
+      correlation_id: options?.correlation_id || fileId,
+      received_clock: options?.received_clock,
+    });
   } catch (err) {
-    console.error('Failed to persist cluster event:', err);
+    console.error('Failed to record causal cluster event:', err);
+    // Fallback envelope if recordCausalEvent encountered persistence issue
+    const fallbackId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now() / 1000;
+    return {
+      event_id: fallbackId,
+      event_type: eventType,
+      origin_node_id: options?.origin_node_id || COORDINATOR_PARTICIPANT_ID,
+      lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID),
+      causal_parent_id: options?.causal_parent_id,
+      causal_parent_ids: options?.causal_parent_ids,
+      correlation_id: options?.correlation_id || fileId,
+      severity,
+      node_id: nodeId,
+      file_id: fileId,
+      message,
+      timestamp: now,
+    };
   }
 }
 
@@ -466,17 +502,54 @@ async function startServer() {
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
   });
 
+  // Lamport Logical Clock Middleware:
+  // Ingests untrusted external client clocks safely and ensures outgoing responses have X-Lamport-Clock header
+  app.use(['/api', '/api/v1'], (req, res, next) => {
+    const clientHeader = req.headers['x-lamport-clock'];
+    if (clientHeader !== undefined) {
+      clockEngine.processUntrustedClientClock(clientHeader);
+    }
+    const origJson = res.json;
+    res.json = function (body: any) {
+      res.setHeader('X-Lamport-Clock', clockEngine.getClock(COORDINATOR_PARTICIPANT_ID));
+      return origJson.call(this, body);
+    };
+    const origSend = res.send;
+    res.send = function (body: any) {
+      res.setHeader('X-Lamport-Clock', clockEngine.getClock(COORDINATOR_PARTICIPANT_ID));
+      return origSend.call(this, body);
+    };
+    next();
+  });
+
   const apiRouter = express.Router();
+
+  // Lamport Logical Clocks Vector Snapshot Endpoint (aliases /clocks and /clock)
+  apiRouter.get(['/clocks', '/clock'], (_req, res) => {
+    const participantClocks = clockEngine.getParticipantClocks();
+    const highestObserved = Math.max(...Object.values(participantClocks));
+    res.json({
+      coordinator: {
+        id: COORDINATOR_PARTICIPANT_ID,
+        clock: participantClocks[COORDINATOR_PARTICIPANT_ID] ?? 0,
+      },
+      nodes: Object.entries(participantClocks)
+        .filter(([id]) => id.startsWith('storage-node-'))
+        .map(([id, clock]) => ({ id, clock })),
+      highest_observed: highestObserved,
+      timestamp: Date.now() / 1000,
+    });
+  });
 
   // Health & Ready
   apiRouter.get('/health', (_req, res) => {
-    res.json({ status: 'healthy', service: 'coordinator', timestamp: Date.now() / 1000 });
+    res.json({ status: 'healthy', service: 'coordinator', timestamp: Date.now() / 1000, lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID) });
   });
 
   apiRouter.get('/ready', (_req, res) => {
     try {
       db.prepare('SELECT 1').get();
-      res.json({ status: 'ready', database: 'connected', timestamp: Date.now() / 1000 });
+      res.json({ status: 'ready', database: 'connected', timestamp: Date.now() / 1000, lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID) });
     } catch (err: any) {
       res.status(503).json({ status: 'unready', error: err.message });
     }
@@ -496,6 +569,7 @@ async function startServer() {
       lease_expires_at: lease ? lease.expires_at : now,
       time_remaining_seconds: remaining,
       coordinator_instance_id: lease ? lease.holder_id : 'coordinator-primary-1',
+      lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID),
     });
   });
 
@@ -666,6 +740,7 @@ async function startServer() {
         physical_bytes_used: inv.physical_bytes_used,
         storage_limit_bytes: n.storage_limit_bytes,
         disk_usage_percent: diskPct,
+        lamport_clock: clockEngine.getClock(n.node_id),
       };
     });
 
@@ -694,6 +769,8 @@ async function startServer() {
     res.json({
       cluster_name: 'ShardSphere Production Cluster',
       coordinator_id: lease ? lease.holder_id : 'coordinator-primary-1',
+      coordinator_lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID),
+      lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID),
       is_leader: isLeaderActive && remaining > 0,
       fencing_token: lease ? Number(lease.fencing_token) : 1,
       total_nodes: nodeList.length,
@@ -754,6 +831,7 @@ async function startServer() {
         physical_bytes_used: inv.physical_bytes_used,
         storage_limit_bytes: n.storage_limit_bytes,
         disk_usage_percent: Number(((inv.physical_bytes_used / (n.storage_limit_bytes || 1)) * 100).toFixed(2)),
+        lamport_clock: clockEngine.getClock(n.node_id),
       };
     });
     res.json(summaries);
@@ -773,23 +851,31 @@ async function startServer() {
     const failures = newState === 'UNAVAILABLE' ? 5 : 0;
     const failAt = newState === 'UNAVAILABLE' ? now : null;
 
+    const sendTs = clockEngine.tickSend(COORDINATOR_PARTICIPANT_ID);
+    const nodeTs = clockEngine.tickReceive(node_id, sendTs);
+    const ackTs = clockEngine.tickSend(node_id);
+    clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, ackTs);
+
     db.prepare(`
       UPDATE storage_nodes
-      SET health_state = ?, consecutive_failures = ?, last_failure_at = ?, last_heartbeat_at = ?, updated_at = ?
+      SET health_state = ?, consecutive_failures = ?, last_failure_at = ?, last_heartbeat_at = ?, updated_at = ?, lamport_clock = ?
       WHERE node_id = ?
-    `).run(newState, failures, failAt, now, now, node_id);
+    `).run(newState, failures, failAt, now, now, nodeTs, node_id);
 
     addEvent(
       'NODE_HEALTH_CHANGED',
       newState === 'UNAVAILABLE' ? 'WARNING' : 'INFO',
       `Operator manually toggled node '${node_id}' from ${oldState} to ${newState}.`,
-      node_id
+      node_id,
+      null,
+      { origin_node_id: node_id, received_clock: sendTs }
     );
 
     res.json({
       node_id,
       previous_state: oldState,
       new_state: newState,
+      lamport_clock: nodeTs,
     });
   });
 
@@ -910,19 +996,29 @@ async function startServer() {
 
     refreshNodeMetrics();
 
+    const nodeClock = clockEngine.tickLocal(node_id);
+    const nodeAckClock = clockEngine.tickSend(node_id);
+    clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, nodeAckClock);
+
+    db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeClock, node_id);
+
     if (purgedStale > 0) {
       addEvent(
         'ORPHAN_CHUNKS_PURGED',
         'INFO',
         `Reconciliation on ${node_id} reclaimed ${(reclaimedBytes / 1024).toFixed(1)} KB by purging ${purgedStale} unreferenced chunk replica(s).`,
-        node_id
+        node_id,
+        null,
+        { origin_node_id: node_id }
       );
     } else {
       addEvent(
         'NODE_RECONCILED',
         'INFO',
         `Reconciliation verified ${verifiedActive} active chunk replica(s) on ${node_id}.`,
-        node_id
+        node_id,
+        null,
+        { origin_node_id: node_id }
       );
     }
 
@@ -933,6 +1029,7 @@ async function startServer() {
       orphaned_reclaimed_bytes: reclaimedBytes,
       corrupted: 0,
       missing_updated: 0,
+      lamport_clock: nodeClock,
     });
   });
 
@@ -1001,24 +1098,31 @@ async function startServer() {
             const targetBinPath = path.join(targetDir, `chunk_${chunk.chunk_id}.bin`);
             fs.writeFileSync(targetBinPath, chunkData);
 
+            const sendTs = clockEngine.tickSend(sourceNode.node_id);
+            const repairTs = clockEngine.tickReceive(repairNode.node_id, sendTs);
+            const ackTs = clockEngine.tickSend(repairNode.node_id);
+            clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, ackTs);
+
             const now = Date.now() / 1000;
-            db.prepare("UPDATE replicas SET status = 'active', last_verified_at = ? WHERE replica_id = ?").run(
+            db.prepare("UPDATE replicas SET status = 'active', last_verified_at = ?, lamport_clock = ? WHERE replica_id = ?").run(
               now,
+              repairTs,
               corruptedOnHealthy.replica_id
             );
 
             const jobId = `job_${crypto.randomBytes(6).toString('hex')}`;
             db.prepare(`
-              INSERT INTO recovery_jobs (job_id, chunk_id, file_id, source_node_id, target_node_id, generation, status, attempts, error_message, created_at, completed_at)
-              VALUES (?, ?, ?, ?, ?, ?, 'completed', 1, null, ?, ?)
-            `).run(jobId, chunk.chunk_id, fileRecord.file_id, sourceNode.node_id, repairNode.node_id, chunk.generation, now, now);
+              INSERT INTO recovery_jobs (job_id, chunk_id, file_id, source_node_id, target_node_id, generation, status, attempts, error_message, created_at, completed_at, lamport_clock)
+              VALUES (?, ?, ?, ?, ?, ?, 'completed', 1, null, ?, ?, ?)
+            `).run(jobId, chunk.chunk_id, fileRecord.file_id, sourceNode.node_id, repairNode.node_id, chunk.generation, now, now, repairTs);
 
             addEvent(
               'REPLICATION_RESTORED',
               'INFO',
-              `Self-healing repaired corrupted replica of chunk ${chunk.chunk_id} on ${repairNode.node_id}.`,
+              `Self-healing repaired corrupted replica of chunk ${chunk.chunk_id} on ${repairNode.node_id} (L:${repairTs}).`,
               repairNode.node_id,
-              fileRecord.file_id
+              fileRecord.file_id,
+              { origin_node_id: repairNode.node_id, correlation_id: fileRecord.file_id }
             );
             recoveredCount++;
             continue;
@@ -1035,6 +1139,11 @@ async function startServer() {
             const targetMetaPath = path.join(targetDir, `chunk_${chunk.chunk_id}.meta.json`);
             const now = Date.now() / 1000;
 
+            const sendTs = clockEngine.tickSend(sourceNode.node_id);
+            const targetTs = clockEngine.tickReceive(targetNode.node_id, sendTs);
+            const ackTs = clockEngine.tickSend(targetNode.node_id);
+            clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, ackTs);
+
             fs.writeFileSync(targetBinPath, chunkData);
             fs.writeFileSync(
               targetMetaPath,
@@ -1044,27 +1153,29 @@ async function startServer() {
                 size_bytes: chunkData.length,
                 checksum_sha256: chunk.checksum_sha256,
                 created_at: now,
+                lamport_clock: targetTs,
               })
             );
 
             const repId = `rep_${crypto.randomBytes(6).toString('hex')}`;
             db.prepare(`
-              INSERT INTO replicas (replica_id, chunk_id, node_id, node_url, status, generation, last_verified_at, created_at)
-              VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
-            `).run(repId, chunk.chunk_id, targetNode.node_id, targetNode.advertised_url, chunk.generation, now, now);
+              INSERT INTO replicas (replica_id, chunk_id, node_id, node_url, status, generation, last_verified_at, created_at, lamport_clock)
+              VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            `).run(repId, chunk.chunk_id, targetNode.node_id, targetNode.advertised_url, chunk.generation, now, now, targetTs);
 
             const jobId = `job_${crypto.randomBytes(6).toString('hex')}`;
             db.prepare(`
-              INSERT INTO recovery_jobs (job_id, chunk_id, file_id, source_node_id, target_node_id, generation, status, attempts, error_message, created_at, completed_at)
-              VALUES (?, ?, ?, ?, ?, ?, 'completed', 1, null, ?, ?)
-            `).run(jobId, chunk.chunk_id, fileRecord.file_id, sourceNode.node_id, targetNode.node_id, chunk.generation, now, now);
+              INSERT INTO recovery_jobs (job_id, chunk_id, file_id, source_node_id, target_node_id, generation, status, attempts, error_message, created_at, completed_at, lamport_clock)
+              VALUES (?, ?, ?, ?, ?, ?, 'completed', 1, null, ?, ?, ?)
+            `).run(jobId, chunk.chunk_id, fileRecord.file_id, sourceNode.node_id, targetNode.node_id, chunk.generation, now, now, targetTs);
 
             addEvent(
               'REPLICATION_RESTORED',
               'INFO',
-              `Self-healing successfully re-replicated chunk ${chunk.chunk_id} from ${sourceNode.node_id} to ${targetNode.node_id}.`,
+              `Self-healing successfully re-replicated chunk ${chunk.chunk_id} from ${sourceNode.node_id} to ${targetNode.node_id} (L:${targetTs}).`,
               targetNode.node_id,
-              fileRecord.file_id
+              fileRecord.file_id,
+              { origin_node_id: targetNode.node_id, correlation_id: fileRecord.file_id }
             );
 
             recoveredCount++;
@@ -1078,6 +1189,7 @@ async function startServer() {
       status: 'completed',
       recovered_chunks: recoveredCount,
       timestamp: Date.now() / 1000,
+      lamport_clock: clockEngine.getClock(COORDINATOR_PARTICIPANT_ID),
     });
   });
 
@@ -1087,11 +1199,84 @@ async function startServer() {
     res.json(jobs);
   });
 
-  // Cluster Events List
+  // Cluster Events List with Deterministic Lamport Ordering & Causal Metadata
   apiRouter.get('/events', (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string) || 50));
-    const events = db.prepare('SELECT * FROM cluster_events ORDER BY timestamp DESC LIMIT ?').all(limit);
-    res.json(events);
+    const orderBy = ((req.query.order_by || req.query.sort) as string) || 'timestamp';
+    const direction = (req.query.direction as string)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (req.query.node_id) {
+      conditions.push('(node_id = ? OR origin_node_id = ?)');
+      params.push(req.query.node_id, req.query.node_id);
+    }
+    if (req.query.origin_node_id) {
+      conditions.push('origin_node_id = ?');
+      params.push(req.query.origin_node_id);
+    }
+    if (req.query.file_id) {
+      conditions.push('(file_id = ? OR correlation_id = ?)');
+      params.push(req.query.file_id, req.query.file_id);
+    }
+    if (req.query.correlation_id) {
+      conditions.push('correlation_id = ?');
+      params.push(req.query.correlation_id);
+    }
+    if (req.query.event_type) {
+      conditions.push('event_type = ?');
+      params.push(req.query.event_type);
+    }
+    if (req.query.severity) {
+      conditions.push('severity = ?');
+      params.push(req.query.severity);
+    }
+    if (req.query.min_clock !== undefined) {
+      const minC = parseInt(req.query.min_clock as string);
+      if (!isNaN(minC)) {
+        conditions.push('lamport_clock >= ?');
+        params.push(minC);
+      }
+    }
+    if (req.query.max_clock !== undefined) {
+      const maxC = parseInt(req.query.max_clock as string);
+      if (!isNaN(maxC)) {
+        conditions.push('lamport_clock <= ?');
+        params.push(maxC);
+      }
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    let orderClause: string;
+    if (orderBy === 'lamport' || orderBy === 'deterministic' || orderBy === 'clock') {
+      orderClause = `ORDER BY lamport_clock ${direction}, origin_node_id ASC, event_id ASC`;
+    } else {
+      orderClause = `ORDER BY timestamp ${direction}, event_id DESC`;
+    }
+
+    params.push(limit);
+    const events = db.prepare(`SELECT * FROM cluster_events ${whereClause} ${orderClause} LIMIT ?`).all(...params) as any[];
+
+    // Parse causal_parent_ids from JSON if needed
+    const formatted = events.map(e => {
+      let parents: string[] | null = null;
+      if (e.causal_parent_ids) {
+        try {
+          parents = JSON.parse(e.causal_parent_ids);
+        } catch {
+          parents = [e.causal_parent_ids];
+        }
+      } else if (e.causal_parent_id) {
+        parents = [e.causal_parent_id];
+      }
+      return {
+        ...e,
+        causal_parent_ids: parents,
+      };
+    });
+
+    res.json(formatted);
   });
 
   // Cryptographic Integrity Verify
@@ -1139,15 +1324,18 @@ async function startServer() {
             try {
               const data = fs.readFileSync(binPath);
               const hash = computeSha256(data);
+              const nodeClock = clockEngine.tickLocal(r.node_id);
+              clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, clockEngine.tickSend(r.node_id));
+
               if (hash === c.checksum_sha256) {
                 statusVal = 'valid';
                 validReps++;
                 const now = Date.now() / 1000;
-                db.prepare("UPDATE replicas SET status = 'active', last_verified_at = ? WHERE replica_id = ?").run(now, r.replica_id);
+                db.prepare("UPDATE replicas SET status = 'active', last_verified_at = ?, lamport_clock = ? WHERE replica_id = ?").run(now, nodeClock, r.replica_id);
               } else {
                 statusVal = 'corrupted';
                 corruptReps++;
-                db.prepare("UPDATE replicas SET status = 'corrupted' WHERE replica_id = ?").run(r.replica_id);
+                db.prepare("UPDATE replicas SET status = 'corrupted', lamport_clock = ? WHERE replica_id = ?").run(nodeClock, r.replica_id);
               }
             } catch {
               statusVal = 'missing';
@@ -1166,10 +1354,14 @@ async function startServer() {
       }
     }
 
+    const auditCompleteClock = clockEngine.tickLocal(COORDINATOR_PARTICIPANT_ID);
     addEvent(
       'INTEGRITY_AUDIT_COMPLETED',
       corruptReps > 0 || missingReps > 0 ? 'WARNING' : 'INFO',
-      `Cryptographic audit verified ${validReps} replica(s) across ${checkedChunks} chunk(s) (${corruptReps} corrupted, ${missingReps} missing).`
+      `Cryptographic audit verified ${validReps} replica(s) across ${checkedChunks} chunk(s) (${corruptReps} corrupted, ${missingReps} missing).`,
+      null,
+      file_id || null,
+      { origin_node_id: COORDINATOR_PARTICIPANT_ID }
     );
 
     res.json({
@@ -1179,6 +1371,7 @@ async function startServer() {
       corrupted_replicas: corruptReps,
       missing_replicas: missingReps,
       details,
+      lamport_clock: auditCompleteClock,
     });
   });
 
@@ -1210,13 +1403,16 @@ async function startServer() {
         fs.writeFileSync(binPath, data);
       }
 
-      db.prepare("UPDATE replicas SET status = 'corrupted' WHERE chunk_id = ? AND node_id = ?").run(chunk_id, targetNodeId);
+      const nodeClock = clockEngine.tickLocal(targetNodeId);
+      db.prepare("UPDATE replicas SET status = 'corrupted', lamport_clock = ? WHERE chunk_id = ? AND node_id = ?").run(nodeClock, chunk_id, targetNodeId);
 
       addEvent(
         'BIT_ROT_INJECTED',
         'ERROR',
-        `Operator injected physical bit-rot into chunk ${chunk_id} on ${targetNodeId}.`,
-        targetNodeId
+        `Operator injected physical bit-rot into chunk ${chunk_id} on ${targetNodeId} (L:${nodeClock}).`,
+        targetNodeId,
+        null,
+        { origin_node_id: targetNodeId }
       );
 
       res.json({
@@ -1224,6 +1420,7 @@ async function startServer() {
         node_id: targetNodeId,
         status: 'corrupted',
         message: 'Physical bit rot injected into replica binary.',
+        lamport_clock: nodeClock,
       });
     } catch (e: any) {
       res.status(500).json({ detail: e.message });
@@ -1238,7 +1435,7 @@ async function startServer() {
 
     const total = (db.prepare("SELECT count(*) as cnt FROM files WHERE status IN ('committed', 'degraded')").get() as any).cnt;
     const fileList = db.prepare(`
-      SELECT file_id, filename, size_bytes, checksum_sha256, chunk_count, replication_factor, metadata_version, status, created_at
+      SELECT file_id, filename, size_bytes, checksum_sha256, chunk_count, replication_factor, metadata_version, status, created_at, lamport_clock
       FROM files
       WHERE status IN ('committed', 'degraded')
       ORDER BY created_at DESC
@@ -1323,77 +1520,117 @@ async function startServer() {
         }
       }
 
+      // 1. Coordinator records UPLOAD_INITIATED local event (advances Coordinator clock)
+      const uploadInitEvent = addEvent(
+        'UPLOAD_INITIATED',
+        'INFO',
+        `Client initiated upload of file '${filename}' (${totalSize} bytes, ${chunkTuples.length} chunk(s)).`,
+        null,
+        fileId,
+        { origin_node_id: COORDINATOR_PARTICIPANT_ID, correlation_id: fileId }
+      );
+
       // Insert file metadata
       db.prepare(`
-        INSERT INTO files (file_id, filename, content_type, size_bytes, checksum_sha256, chunk_count, chunk_size_bytes, replication_factor, metadata_version, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?, ?)
-      `).run(fileId, filename, contentType, totalSize, fileSha256, chunkTuples.length, DEFAULT_CHUNK_SIZE, REPLICATION_FACTOR, now, now);
+        INSERT INTO files (file_id, filename, content_type, size_bytes, checksum_sha256, chunk_count, chunk_size_bytes, replication_factor, metadata_version, status, created_at, updated_at, lamport_clock)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?, ?, ?)
+      `).run(fileId, filename, contentType, totalSize, fileSha256, chunkTuples.length, DEFAULT_CHUNK_SIZE, REPLICATION_FACTOR, now, now, uploadInitEvent.lamport_clock);
 
-    // Distribute replicas evenly across healthy nodes
-    for (let i = 0; i < chunkTuples.length; i++) {
-      const ct = chunkTuples[i];
-      const chunkId = `chk_${crypto.randomBytes(8).toString('hex')}`;
+      // 2. Distribute replicas across healthy nodes with explicit Lamport Send/Receive rules
+      for (let i = 0; i < chunkTuples.length; i++) {
+        const ct = chunkTuples[i];
+        const chunkId = `chk_${crypto.randomBytes(8).toString('hex')}`;
 
-      db.prepare(`
-        INSERT INTO chunks (chunk_id, file_id, sequence_index, size_bytes, checksum_sha256, generation, created_at)
-        VALUES (?, ?, ?, ?, ?, 1, ?)
-      `).run(chunkId, fileId, ct.seq, ct.data.length, ct.sha, now);
+        const chosenNodes: any[] = [];
+        for (let r = 0; r < REPLICATION_FACTOR; r++) {
+          const nodeIdx = (i + r) % healthyNodes.length;
+          chosenNodes.push(healthyNodes[nodeIdx]);
+        }
 
-      const chosenNodes: any[] = [];
-      for (let r = 0; r < REPLICATION_FACTOR; r++) {
-        const nodeIdx = (i + r) % healthyNodes.length;
-        chosenNodes.push(healthyNodes[nodeIdx]);
-      }
+        let chunkMaxClock = 0;
 
-      for (const node of chosenNodes) {
-        const dir = getNodeChunksDir(node.node_id);
-        const binPath = path.join(dir, `chunk_${chunkId}.bin`);
-        const metaPath = path.join(dir, `chunk_${chunkId}.meta.json`);
+        for (const node of chosenNodes) {
+          const dir = getNodeChunksDir(node.node_id);
+          const binPath = path.join(dir, `chunk_${chunkId}.bin`);
+          const metaPath = path.join(dir, `chunk_${chunkId}.meta.json`);
 
-        fs.writeFileSync(binPath, ct.data);
-        fs.writeFileSync(
-          metaPath,
-          JSON.stringify({
-            chunk_id: chunkId,
-            node_id: node.node_id,
-            size_bytes: ct.data.length,
-            checksum_sha256: ct.sha,
-            created_at: now,
-          })
-        );
+          // Rule 2 (Send): Coordinator increments its clock and sends placement message
+          const sendClock = clockEngine.tickSend(COORDINATOR_PARTICIPANT_ID);
 
-        const repId = `rep_${crypto.randomBytes(6).toString('hex')}`;
+          // Rule 3 (Receive): Storage node receives chunk write message and advances clock
+          const nodeRecvClock = clockEngine.tickReceive(node.node_id, sendClock);
+
+          fs.writeFileSync(binPath, ct.data);
+          fs.writeFileSync(
+            metaPath,
+            JSON.stringify({
+              chunk_id: chunkId,
+              node_id: node.node_id,
+              size_bytes: ct.data.length,
+              checksum_sha256: ct.sha,
+              created_at: now,
+              lamport_clock: nodeRecvClock,
+            })
+          );
+
+          // Rule 2 (Send): Storage node sends write ACK back to coordinator
+          const nodeAckClock = clockEngine.tickSend(node.node_id);
+
+          // Rule 3 (Receive): Coordinator processes storage node ACK
+          clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, nodeAckClock);
+
+          chunkMaxClock = Math.max(chunkMaxClock, nodeRecvClock);
+
+          // Record replica with storage node's logical clock
+          const repId = `rep_${crypto.randomBytes(6).toString('hex')}`;
+          db.prepare(`
+            INSERT INTO replicas (replica_id, chunk_id, node_id, node_url, status, generation, last_verified_at, created_at, lamport_clock)
+            VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?)
+          `).run(repId, chunkId, node.node_id, node.advertised_url, now, now, nodeRecvClock);
+
+          db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeAckClock, node.node_id);
+        }
+
         db.prepare(`
-          INSERT INTO replicas (replica_id, chunk_id, node_id, node_url, status, generation, last_verified_at, created_at)
-          VALUES (?, ?, ?, ?, 'active', 1, ?, ?)
-        `).run(repId, chunkId, node.node_id, node.advertised_url, now, now);
+          INSERT INTO chunks (chunk_id, file_id, sequence_index, size_bytes, checksum_sha256, generation, created_at, lamport_clock)
+          VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        `).run(chunkId, fileId, ct.seq, ct.data.length, ct.sha, now, chunkMaxClock);
       }
-    }
 
-    refreshNodeMetrics();
+      refreshNodeMetrics();
 
-    const lease = db.prepare("SELECT fencing_token FROM leader_leases WHERE lease_id = 'coordinator_primary_lease'").get() as any;
-    const token = lease ? lease.fencing_token : 1;
+      const lease = db.prepare("SELECT fencing_token FROM leader_leases WHERE lease_id = 'coordinator_primary_lease'").get() as any;
+      const token = lease ? lease.fencing_token : 1;
 
-    addEvent(
-      'FILE_COMMITTED',
-      'INFO',
-      `File '${filename}' (${totalSize} bytes, ${chunkTuples.length} chunks, ${REPLICATION_FACTOR}x replication) successfully committed with Fencing Token #${token}.`,
-      null,
-      fileId
-    );
+      // 3. Coordinator records FILE_COMMITTED event linked causally to UPLOAD_INITIATED
+      const commitEvent = addEvent(
+        'FILE_COMMITTED',
+        'INFO',
+        `File '${filename}' (${totalSize} bytes, ${chunkTuples.length} chunks, ${REPLICATION_FACTOR}x replication) successfully committed with Fencing Token #${token}.`,
+        null,
+        fileId,
+        {
+          origin_node_id: COORDINATOR_PARTICIPANT_ID,
+          correlation_id: fileId,
+          causal_parent_id: uploadInitEvent.event_id,
+          causal_parent_ids: [uploadInitEvent.event_id],
+        }
+      );
 
-    res.status(201).json({
-      file_id: fileId,
-      filename,
-      size_bytes: totalSize,
-      checksum_sha256: fileSha256,
-      chunk_count: chunkTuples.length,
-      replication_factor: REPLICATION_FACTOR,
-      status: 'committed',
-      metadata_version: 1,
-      created_at: now,
-    });
+      db.prepare('UPDATE files SET lamport_clock = ? WHERE file_id = ?').run(commitEvent.lamport_clock, fileId);
+
+      res.status(201).json({
+        file_id: fileId,
+        filename,
+        size_bytes: totalSize,
+        checksum_sha256: fileSha256,
+        chunk_count: chunkTuples.length,
+        replication_factor: REPLICATION_FACTOR,
+        status: 'committed',
+        metadata_version: 1,
+        created_at: now,
+        lamport_clock: commitEvent.lamport_clock,
+      });
   });
 
   // File Details
@@ -1418,6 +1655,7 @@ async function startServer() {
         size_bytes: c.size_bytes,
         checksum_sha256: c.checksum_sha256,
         generation: c.generation,
+        lamport_clock: c.lamport_clock ?? 0,
         replicas: reps.map(r => ({
           replica_id: r.replica_id,
           node_id: r.node_id,
@@ -1425,6 +1663,7 @@ async function startServer() {
           status: r.status,
           generation: r.generation,
           last_verified_at: r.last_verified_at,
+          lamport_clock: r.lamport_clock ?? 0,
         })),
         healthy_replicas_count: healthyCount,
       };
@@ -1443,6 +1682,7 @@ async function startServer() {
       status: fileRecord.status,
       created_at: fileRecord.created_at,
       updated_at: fileRecord.updated_at,
+      lamport_clock: fileRecord.lamport_clock ?? 0,
       chunks: chunkDetails,
     });
   });
@@ -1515,7 +1755,7 @@ async function startServer() {
     res.send(fullFile);
   });
 
-  // File Delete
+  // File Delete with Lamport logical clock synchronization across storage participants
   apiRouter.delete('/files/:file_id', (req, res) => {
     const { file_id } = req.params;
     const fileRecord = db.prepare('SELECT * FROM files WHERE file_id = ?').get(file_id) as any;
@@ -1525,10 +1765,17 @@ async function startServer() {
 
     const chunks = db.prepare('SELECT * FROM chunks WHERE file_id = ?').all(file_id) as any[];
 
+    // Lamport Rule 2 (Send): Coordinator sends delete instruction to storage nodes
+    const deleteSendClock = clockEngine.tickSend(COORDINATOR_PARTICIPANT_ID);
+
     // Delete chunks physically from disk across all 5 storage nodes
-    for (const chunk of chunks) {
-      for (let i = 1; i <= 5; i++) {
-        const dir = getNodeChunksDir(`storage-node-${i}`);
+    for (let i = 1; i <= 5; i++) {
+      const nid = `storage-node-${i}`;
+      // Storage node processes deletion message
+      const nodeRecvClock = clockEngine.tickReceive(nid, deleteSendClock);
+
+      const dir = getNodeChunksDir(nid);
+      for (const chunk of chunks) {
         const binPath = path.join(dir, `chunk_${chunk.chunk_id}.bin`);
         const metaPath = path.join(dir, `chunk_${chunk.chunk_id}.meta.json`);
         try {
@@ -1538,21 +1785,31 @@ async function startServer() {
           // ignore
         }
       }
+
+      // Storage node sends deletion ACK back
+      const nodeAckClock = clockEngine.tickSend(nid);
+      clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, nodeAckClock);
+      db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeAckClock, nid);
     }
 
     // Cascade delete in SQLite
     db.prepare('DELETE FROM files WHERE file_id = ?').run(file_id);
     refreshNodeMetrics();
 
-    addEvent(
+    const delEvent = addEvent(
       'FILE_DELETED',
       'INFO',
-      `File '${fileRecord.filename}' (${file_id}) deleted and storage reclaimed.`,
+      `File '${fileRecord.filename}' (${file_id}) deleted and storage reclaimed across storage nodes.`,
       null,
-      file_id
+      file_id,
+      { origin_node_id: COORDINATOR_PARTICIPANT_ID, correlation_id: file_id }
     );
 
-    res.json({ file_id, deleted: true });
+    res.json({
+      file_id,
+      deleted: true,
+      lamport_clock: delEvent.lamport_clock,
+    });
   });
 
   // Mount API router
