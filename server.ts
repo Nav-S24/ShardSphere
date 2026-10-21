@@ -996,31 +996,33 @@ async function startServer() {
 
     refreshNodeMetrics();
 
-    const nodeClock = clockEngine.tickLocal(node_id);
+    // 1. Storage node records local reconciliation operation (Rule 1 Local Event via addEvent)
+    const reconEvent = purgedStale > 0
+      ? addEvent(
+          'ORPHAN_CHUNKS_PURGED',
+          'INFO',
+          `Reconciliation on ${node_id} reclaimed ${(reclaimedBytes / 1024).toFixed(1)} KB by purging ${purgedStale} unreferenced chunk replica(s).`,
+          node_id,
+          null,
+          { origin_node_id: node_id }
+        )
+      : addEvent(
+          'NODE_RECONCILED',
+          'INFO',
+          `Reconciliation verified ${verifiedActive} active chunk replica(s) on ${node_id}.`,
+          node_id,
+          null,
+          { origin_node_id: node_id }
+        );
+
+    // 2. Storage node sends reconciliation completion ACK to coordinator (Rule 2 Send)
     const nodeAckClock = clockEngine.tickSend(node_id);
+
+    // 3. Coordinator receives storage node ACK (Rule 3 Receive)
     clockEngine.tickReceive(COORDINATOR_PARTICIPANT_ID, nodeAckClock);
 
-    db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeClock, node_id);
-
-    if (purgedStale > 0) {
-      addEvent(
-        'ORPHAN_CHUNKS_PURGED',
-        'INFO',
-        `Reconciliation on ${node_id} reclaimed ${(reclaimedBytes / 1024).toFixed(1)} KB by purging ${purgedStale} unreferenced chunk replica(s).`,
-        node_id,
-        null,
-        { origin_node_id: node_id }
-      );
-    } else {
-      addEvent(
-        'NODE_RECONCILED',
-        'INFO',
-        `Reconciliation verified ${verifiedActive} active chunk replica(s) on ${node_id}.`,
-        node_id,
-        null,
-        { origin_node_id: node_id }
-      );
-    }
+    // 4. Update storage node persisted clock to reflect its latest active participant clock (nodeAckClock)
+    db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeAckClock, node_id);
 
     res.json({
       node_id,
@@ -1029,7 +1031,7 @@ async function startServer() {
       orphaned_reclaimed_bytes: reclaimedBytes,
       corrupted: 0,
       missing_updated: 0,
-      lamport_clock: nodeClock,
+      lamport_clock: nodeAckClock,
     });
   });
 
@@ -1354,8 +1356,7 @@ async function startServer() {
       }
     }
 
-    const auditCompleteClock = clockEngine.tickLocal(COORDINATOR_PARTICIPANT_ID);
-    addEvent(
+    const auditEvent = addEvent(
       'INTEGRITY_AUDIT_COMPLETED',
       corruptReps > 0 || missingReps > 0 ? 'WARNING' : 'INFO',
       `Cryptographic audit verified ${validReps} replica(s) across ${checkedChunks} chunk(s) (${corruptReps} corrupted, ${missingReps} missing).`,
@@ -1371,7 +1372,7 @@ async function startServer() {
       corrupted_replicas: corruptReps,
       missing_replicas: missingReps,
       details,
-      lamport_clock: auditCompleteClock,
+      lamport_clock: auditEvent.lamport_clock,
     });
   });
 
@@ -1403,24 +1404,24 @@ async function startServer() {
         fs.writeFileSync(binPath, data);
       }
 
-      const nodeClock = clockEngine.tickLocal(targetNodeId);
-      db.prepare("UPDATE replicas SET status = 'corrupted', lamport_clock = ? WHERE chunk_id = ? AND node_id = ?").run(nodeClock, chunk_id, targetNodeId);
-
-      addEvent(
+      const rotEvent = addEvent(
         'BIT_ROT_INJECTED',
         'ERROR',
-        `Operator injected physical bit-rot into chunk ${chunk_id} on ${targetNodeId} (L:${nodeClock}).`,
+        `Operator injected physical bit-rot into chunk ${chunk_id} on ${targetNodeId}.`,
         targetNodeId,
         null,
         { origin_node_id: targetNodeId }
       );
+
+      db.prepare("UPDATE replicas SET status = 'corrupted', lamport_clock = ? WHERE chunk_id = ? AND node_id = ?").run(rotEvent.lamport_clock, chunk_id, targetNodeId);
+      db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(rotEvent.lamport_clock, targetNodeId);
 
       res.json({
         chunk_id,
         node_id: targetNodeId,
         status: 'corrupted',
         message: 'Physical bit rot injected into replica binary.',
-        lamport_clock: nodeClock,
+        lamport_clock: rotEvent.lamport_clock,
       });
     } catch (e: any) {
       res.status(500).json({ detail: e.message });
@@ -1547,6 +1548,12 @@ async function startServer() {
           chosenNodes.push(healthyNodes[nodeIdx]);
         }
 
+        // Insert chunk metadata first to satisfy FOREIGN KEY constraint from replicas
+        db.prepare(`
+          INSERT INTO chunks (chunk_id, file_id, sequence_index, size_bytes, checksum_sha256, generation, created_at, lamport_clock)
+          VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        `).run(chunkId, fileId, ct.seq, ct.data.length, ct.sha, now, uploadInitEvent.lamport_clock);
+
         let chunkMaxClock = 0;
 
         for (const node of chosenNodes) {
@@ -1591,10 +1598,7 @@ async function startServer() {
           db.prepare('UPDATE storage_nodes SET lamport_clock = ? WHERE node_id = ?').run(nodeAckClock, node.node_id);
         }
 
-        db.prepare(`
-          INSERT INTO chunks (chunk_id, file_id, sequence_index, size_bytes, checksum_sha256, generation, created_at, lamport_clock)
-          VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-        `).run(chunkId, fileId, ct.seq, ct.data.length, ct.sha, now, chunkMaxClock);
+        db.prepare('UPDATE chunks SET lamport_clock = ? WHERE chunk_id = ?').run(chunkMaxClock, chunkId);
       }
 
       refreshNodeMetrics();

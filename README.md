@@ -77,12 +77,14 @@ shardsphere/
 | `GET` | `/api/v1/files` | List committed files with pagination |
 | `GET` | `/api/v1/files/{file_id}` | Detailed file chunk layout and replica health status |
 | `GET` | `/api/v1/files/{file_id}/download` | Reassemble chunks and download full verified file |
-| `DELETE` | `/api/v1/files/{file_id}` | Coordinated physical deletion across all nodes |
+| `DELETE` | `/api/v1/files/{file_id}` | Coordinated physical deletion across all nodes with Lamport clock synchronization |
 | `GET` | `/api/v1/cluster` | Real-time cluster overview, active nodes, and stored data stats |
 | `GET` | `/api/v1/nodes` | List all 5 storage nodes with health states and disk stats |
 | `GET` | `/api/v1/leader` | Current leader election lease and fencing token |
 | `GET` | `/api/v1/recovery/jobs` | Self-healing re-replication job status |
 | `POST` | `/api/v1/integrity/verify` | Trigger on-demand cryptographic audit of all stored chunks |
+| `GET` | `/api/v1/clocks` (or `/api/v1/clock`) | Real-time scalar Lamport clock vector across coordinator and 5 storage nodes |
+| `GET` | `/api/v1/events` | Audit event stream with deterministic Lamport causal ordering (`order_by=lamport`) |
 
 ### Storage Node Endpoints (`/`)
 | Method | Endpoint | Description |
@@ -98,70 +100,88 @@ shardsphere/
 
 ---
 
+## Phase 4: Distributed Lamport Logical Clocks & Causal Ordering
+
+ShardSphere integrates Leslie Lamport's 1978 logical clock specification to establish happens-before causal ordering across distributed participants:
+
+### 1. Participants Topology
+The cluster defines 6 distinct participants:
+- `coordinator-primary-1`: Coordinator service managing cluster leases, uploads, and health reconciliation.
+- `storage-node-1` through `storage-node-5`: 5 independent storage nodes with isolated volumes (`/data/storage_node_<n>/chunks`).
+
+### 2. Lamport Clock Rules
+- **Rule 1 (Local Event)**: Internal participant action advances clock: $L_i = L_i + 1$.
+- **Rule 2 (Send Event)**: Outgoing RPC/message advances sender clock and attaches timestamp: $L_i = L_i + 1, T_{\text{msg}} = L_i$.
+- **Rule 3 (Receive Event)**: Incoming message updates receiver clock past message timestamp: $L_j = \max(L_j, T_{\text{msg}}) + 1$.
+
+### 3. Persistence & Crash Recovery
+Clocks are persisted in SQLite via `participant_clocks`:
+```sql
+CREATE TABLE IF NOT EXISTS participant_clocks (
+  participant_id VARCHAR(64) PRIMARY KEY,
+  clock_value BIGINT NOT NULL DEFAULT 0,
+  updated_at FLOAT NOT NULL
+);
+```
+Conditional upserts prevent clock regression during concurrent updates. On crash recovery, `LamportClockEngine.hydrate()` inspects both `participant_clocks` and historical `cluster_events` to restore each participant to its highest observed historical high-water mark.
+
+### 4. Causal Event Metadata & Multiple Causal Parents
+Every event logged to `cluster_events` contains:
+- `lamport_clock`: Logical timestamp when event occurred.
+- `origin_node_id`: Participant that generated the event.
+- `causal_parent_id`: Primary predecessor event ID.
+- `causal_parent_ids`: Serialized JSON array of predecessor event IDs supporting multi-parent causality (e.g., multi-node replication completions or quorum convergence).
+- `correlation_id`: Lifecycle correlation tag (e.g., `file_id`).
+
+### 5. `X-Lamport-Clock` Middleware & Security
+- **Incoming**: Middleware intercepts `X-Lamport-Clock` headers on `/api` and `/api/v1`. Untrusted values are strictly validated (rejecting negative, non-numeric, or non-finite inputs). If an attacker sends a spoofed clock (> current clock + 10,000 steps or near `MAX_SAFE_INTEGER`), the coordinator defends against clock exhaustion by incrementing only a single local tick (`tickLocal`). Valid headers advance the coordinator clock via Rule 3.
+- **Outgoing**: All responses include the authoritative `X-Lamport-Clock: <coordinator_clock>` header.
+
+### 6. Deterministic Event Ordering & Limitations
+Events can be fetched ordered by logical time:
+```
+GET /api/v1/events?order_by=lamport&direction=desc
+```
+Tie-breaking is strictly deterministic:
+`ORDER BY lamport_clock DESC, origin_node_id ASC, event_id ASC`
+
+**Limitations**:
+Lamport clocks establish a **partial order** ($A \to B \implies L(A) < L(B)$). The converse ($L(A) < L(B) \implies A \to B$) does not strictly hold between independent nodes that never communicated. The secondary tie-breaking keys create a deterministic **total order** consistent with causality, but do not imply a direct causal connection between concurrent events.
+
+### 7. Architectural Boundaries
+- **Lamport Clocks**: Causal lineage and chronological debugging. They do **not** enforce mutual exclusion or data consensus.
+- **Leader Leases & Fencing Tokens**: Mutual exclusion for metadata operations and split-brain prevention via monotonic tokens (`#28`).
+- **Replication Quorum (3x)**: Physical durability guaranteeing availability across storage node failures.
+- **SHA-256 Checksums**: Cryptographic data integrity detecting bit-rot and transmission errors.
+
+---
+
 ## Deployment & Verification
 
-### Option A: Docker Compose (Standard Production Deployment)
+### Running the Full-Stack Application
 
 ```bash
-# 1. Create environment file
-cp .env.example .env
+# Start server with Vite middleware on port 3000 (0.0.0.0)
+npm run dev
 
-# 2. Build and start all 8 containers
-docker compose up --build -d
-
-# 3. Check container status
-docker compose ps
-
-# 4. View cluster logs
-docker compose logs -f coordinator
-```
-
-### Option B: Local Process Execution (Developer Environment)
-
-```bash
-# 1. Start all 5 storage nodes + Coordinator
-bash scripts/start_cluster.sh
-
-# 2. Verify health of all services
-bash scripts/verify_health.sh
-
-# 3. Stop services
-bash scripts/stop_cluster.sh
+# Production build
+npm run build
+npm start
 ```
 
 ---
 
-## Automated Test Execution
+## Automated Test Suites
 
-Run the complete test suite across the backend coordinator and storage nodes:
+The TypeScript test suite covers clock mechanics, workflow causal progression, cluster integration, and storage audit invariants:
 
-```bash
-# Run all 20 unit, integration, election, and fault injection tests
-pytest backend/tests/ storage_node/tests/ -v
-```
-
-### Verified Test Results (20/20 Passed):
-```
-============================== test session starts ==============================
-backend/tests/test_coordinator_models.py::test_database_schema_creation_and_file_model PASSED
-backend/tests/test_distributor.py::test_chunk_splitting PASSED
-backend/tests/test_distributor.py::test_empty_file_chunk_splitting PASSED
-backend/tests/test_leader_election.py::test_leader_lease_acquisition_and_fencing_token PASSED
-backend/tests/test_leader_election_two_instances.py::test_two_coordinator_instances_lease_acquisition_and_fencing PASSED
-backend/tests/test_leader_election_two_instances.py::test_lease_expiry_takeover_and_token_increment PASSED
-backend/tests/test_leader_election_two_instances.py::test_stale_leader_split_brain_write_rejection PASSED
-backend/tests/test_real_fault_injection.py::test_real_storage_node_failure_healing_and_recovery PASSED
-backend/tests/test_returning_node_reconciliation.py::test_returning_node_reconciliation_active_and_stale_chunks PASSED
-backend/tests/test_storage_engine_integration.py::test_end_to_end_storage_engine_lifecycle PASSED
-backend/tests/test_storage_engine_integration.py::test_replica_corruption_failover PASSED
-backend/tests/test_storage_engine_unit.py::test_1mib_chunk_splitting_and_checksums PASSED
-backend/tests/test_storage_engine_unit.py::test_empty_file_handling PASSED
-backend/tests/test_storage_engine_unit.py::test_arbitrary_binary_file_integrity PASSED
-backend/tests/test_storage_engine_unit.py::test_placement_strategy_distinctness_and_distribution PASSED
-backend/tests/test_storage_engine_unit.py::test_placement_fails_when_insufficient_healthy_nodes PASSED
-storage_node/tests/test_storage_node.py::test_chunk_write_and_read PASSED
-storage_node/tests/test_storage_node.py::test_chunk_checksum_mismatch PASSED
-storage_node/tests/test_storage_node.py::test_path_traversal_prevention PASSED
-storage_node/tests/test_storage_node.py::test_storage_stats_and_delete PASSED
-============================== 20 passed in 5.44s ==============================
-```
+| Test Script | Description |
+|---|---|
+| `npm run test:clock` | 12 focused unit tests for LamportClockEngine (Rules 1-3, concurrency, persistence, overflow) |
+| `npm run test:workflow` | 6 integration tests for causal upload, multi-node replication, and self-healing |
+| `npm run test:audit` | 6 storage consistency, inventory classification, and SHA-256 audit tests |
+| `npm run test:coverage` | Bit-rot detection & in-place repair, orphan reclamation, and quota enforcement |
+| `npm run test` | Full 8-stage end-to-end cluster integration suite |
+| `npm run test:all` | Executes all 5 test suites consecutively |
+| `npm run lint` | TypeScript type-checking (`tsc --noEmit`) |
+| `npm run build` | Production client build verification |

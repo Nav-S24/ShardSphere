@@ -12,7 +12,8 @@
     "test:coverage": "tsx tests/missing_coverage_regression.test.ts",
     "test:clock": "tsx tests/lamport_clock_engine.test.ts",
     "test:workflow": "tsx tests/lamport_workflow_integration.test.ts",
-    "test:all": "tsx tests/cluster_integration.test.ts && tsx tests/audit_consistency_regression.test.ts && tsx tests/missing_coverage_regression.test.ts && tsx tests/lamport_clock_engine.test.ts && tsx tests/lamport_workflow_integration.test.ts",
+    "test:double-increment": "tsx tests/clock_double_increment_regression.test.ts",
+    "test:all": "tsx tests/cluster_integration.test.ts && tsx tests/audit_consistency_regression.test.ts && tsx tests/missing_coverage_regression.test.ts && tsx tests/lamport_clock_engine.test.ts && tsx tests/lamport_workflow_integration.test.ts && tsx tests/clock_double_increment_regression.test.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
